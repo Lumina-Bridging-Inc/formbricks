@@ -25,6 +25,14 @@ export interface TFieldMapping {
 }
 
 export const CSV_IMPORT_MISSING_COLUMNS_ERROR_CODE = "CSV_IMPORT_MISSING_COLUMNS";
+export const CSV_IMPORT_FAILED_ERROR_CODE = "CSV_IMPORT_FAILED";
+export const CSV_FILE_TOO_LARGE_ERROR_CODE = "CSV_FILE_TOO_LARGE";
+export const CSV_FILES_ONLY_ERROR_CODE = "CSV_FILES_ONLY";
+export const CSV_PARSE_ERROR_CODE = "CSV_PARSE_ERROR";
+export const CSV_AT_LEAST_ONE_ROW_ERROR_CODE = "CSV_AT_LEAST_ONE_ROW";
+export const CSV_MAX_RECORDS_ERROR_CODE = "CSV_MAX_RECORDS";
+export const CSV_INCONSISTENT_COLUMNS_ERROR_CODE = "CSV_INCONSISTENT_COLUMNS";
+export const CSV_EMPTY_COLUMN_HEADERS_ERROR_CODE = "CSV_EMPTY_COLUMN_HEADERS";
 
 export type TTargetFieldType = "string" | "enum" | "timestamp" | "float64" | "boolean" | "jsonb" | "string[]";
 
@@ -227,8 +235,8 @@ sub-003,2026-01-15T10:10:30Z,nps_comment,text,"Documentation could be clearer",c
 `;
 
 export const MAX_CSV_VALUES = {
-  FILE_SIZE: 2_097_152, // 2MB (2 * 1024 * 1024)
-  RECORDS: 1_000, // 1,000 records
+  FILE_SIZE: 15 * 1024 * 1024, // 15MB
+  RECORDS: 10_000, // 10,000 records
 } as const;
 
 export const createFeedbackCSVDataSchema = (t: TFunction) =>
@@ -241,8 +249,15 @@ export const createFeedbackCSVDataSchema = (t: TFunction) =>
       }),
     })
     .superRefine((rows, ctx) => {
+      // `.min(1)` above already reports empty input, but zod still runs this refinement, so guard
+      // against `rows[0]` being undefined — otherwise `Object.keys(undefined)` throws a raw TypeError
+      // out of safeParse instead of surfacing the friendly CSV_AT_LEAST_ONE_ROW error (ENG-1799).
+      if (rows.length === 0) {
+        return;
+      }
       const localeSort = (a: string, b: string) => a.localeCompare(b);
-      const firstRowKeys = Object.keys(rows[0]).sort(localeSort).join(",");
+      const firstRowKeyList = Object.keys(rows[0]);
+      const firstRowKeys = [...firstRowKeyList].sort(localeSort).join(",");
 
       for (let i = 1; i < rows.length; i++) {
         const rowKeys = Object.keys(rows[i]).sort(localeSort).join(",");
@@ -255,7 +270,7 @@ export const createFeedbackCSVDataSchema = (t: TFunction) =>
         }
       }
 
-      const emptyHeaders = Object.keys(rows[0]).filter((k) => k.trim() === "");
+      const emptyHeaders = firstRowKeyList.filter((k) => k.trim() === "");
       if (emptyHeaders.length > 0) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -277,7 +292,11 @@ export const ZFormbricksFeedbackSourceForm = z.object({
 
 export type TFormbricksFeedbackSourceForm = z.infer<typeof ZFormbricksFeedbackSourceForm>;
 
-export const getTranslatedFeedbackSourceError = (errorCode: string, t: TFunction): string => {
+export const getTranslatedFeedbackSourceError = (
+  errorCode: string,
+  t: TFunction,
+  values?: { row?: number | string; max?: number | string }
+): string => {
   switch (errorCode) {
     case "FEEDBACK_SOURCE_NAME_DUPLICATE":
       return t("workspace.unify.error_source_name_duplicate");
@@ -287,12 +306,34 @@ export const getTranslatedFeedbackSourceError = (errorCode: string, t: TFunction
       return t("workspace.unify.error_source_field_mapping_duplicate");
     case CSV_IMPORT_MISSING_COLUMNS_ERROR_CODE:
       return t("workspace.unify.csv_saved_mapping_missing_columns");
+    case CSV_IMPORT_FAILED_ERROR_CODE:
+      return t("common.something_went_wrong");
+    case CSV_FILE_TOO_LARGE_ERROR_CODE:
+      return t("workspace.unify.csv_file_too_large");
+    case CSV_FILES_ONLY_ERROR_CODE:
+      return t("workspace.unify.csv_files_only");
+    case CSV_PARSE_ERROR_CODE:
+      return t("common.failed_to_parse_csv");
+    case CSV_AT_LEAST_ONE_ROW_ERROR_CODE:
+      return t("workspace.unify.csv_at_least_one_row");
+    case CSV_MAX_RECORDS_ERROR_CODE:
+      return t("workspace.unify.csv_max_records", {
+        max: values?.max?.toLocaleString() ?? MAX_CSV_VALUES.RECORDS.toLocaleString(),
+      });
+    case CSV_INCONSISTENT_COLUMNS_ERROR_CODE:
+      return t("workspace.unify.csv_inconsistent_columns", {
+        row: values?.row?.toString() ?? "",
+      });
+    case CSV_EMPTY_COLUMN_HEADERS_ERROR_CODE:
+      return t("workspace.unify.csv_empty_column_headers");
     case "FEEDBACK_SOURCE_NAME_REQUIRED":
       return t("workspace.unify.error_source_name_required");
     case "FEEDBACK_SOURCE_SURVEY_REQUIRED":
       return t("workspace.unify.error_source_survey_required");
     case "FEEDBACK_SOURCE_QUESTIONS_REQUIRED":
       return t("workspace.unify.error_source_questions_required");
+    case "FEEDBACK_SOURCE_DIRECTORY_NOT_ASSIGNED_TO_WORKSPACE":
+      return t("workspace.unify.error_source_directory_not_assigned");
     default:
       return errorCode;
   }

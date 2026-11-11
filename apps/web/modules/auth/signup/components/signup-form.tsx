@@ -3,14 +3,16 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FormProvider, useForm } from "react-hook-form";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import Turnstile, { useTurnstile } from "react-turnstile";
 import { z } from "zod";
+import { SIGNUP_EMAIL_DOMAIN_BLOCKED_ERROR_CODE } from "@formbricks/types/errors";
 import { TUserLocale, ZUserName, ZUserPassword } from "@formbricks/types/user";
 import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { buildAttributionQuerySuffix } from "@/modules/auth/lib/attribution";
 import { buildVerificationRequestedPath } from "@/modules/auth/lib/verification-links";
 import { createUserAction } from "@/modules/auth/signup/actions";
 import { TermsPrivacyLinks } from "@/modules/auth/signup/components/terms-privacy-links";
@@ -47,8 +49,6 @@ interface SignupFormProps {
   isSsoEnabled: boolean;
   samlSsoEnabled: boolean;
   isTurnstileConfigured: boolean;
-  samlTenant: string;
-  samlProduct: string;
   turnstileSiteKey?: string;
   isFormbricksCloud: boolean;
 }
@@ -69,8 +69,6 @@ export const SignupForm = ({
   isSsoEnabled,
   samlSsoEnabled,
   isTurnstileConfigured,
-  samlTenant,
-  samlProduct,
   turnstileSiteKey,
   isFormbricksCloud,
 }: SignupFormProps) => {
@@ -85,6 +83,19 @@ export const SignupForm = ({
 
   const turnstile = useTurnstile();
 
+  // An SSO sign-up rejected for a personal email domain redirects back here with ?error=<code>.
+  // Match the known code exactly (never echo the raw param). Track the last error value we toasted
+  // (rather than a permanent boolean) so strict-mode's double effect invocation and locale re-renders
+  // are deduped, but a fresh, distinct rejection value would still notify.
+  const oauthError = searchParams?.get("error");
+  const lastToastedOauthError = useRef<string | null>(null);
+  useEffect(() => {
+    if (oauthError !== SIGNUP_EMAIL_DOMAIN_BLOCKED_ERROR_CODE) return;
+    if (lastToastedOauthError.current === oauthError) return;
+    lastToastedOauthError.current = oauthError;
+    toast.error(t("auth.signup.company_email_required"));
+  }, [oauthError, t]);
+
   const returnToUrl = useMemo(() => {
     if (inviteToken) {
       return webAppUrl + "/invite?token=" + inviteToken;
@@ -92,6 +103,13 @@ export const SignupForm = ({
       return webAppUrl;
     }
   }, [inviteToken, webAppUrl]);
+
+  const loginHref = useMemo(() => {
+    const base = inviteToken ? `/auth/login?callbackUrl=${returnToUrl}` : "/auth/login";
+    const attributionSuffix = buildAttributionQuerySuffix(searchParams);
+    if (!attributionSuffix) return base;
+    return `${base}${base.includes("?") ? "&" : "?"}${attributionSuffix}`;
+  }, [inviteToken, returnToUrl, searchParams]);
 
   const form = useForm<TSignupInput>({
     defaultValues: {
@@ -108,9 +126,17 @@ export const SignupForm = ({
         throw new Error(t("auth.signup.please_verify_captcha"));
       }
 
+      const resetTurnstileIfConfigured = () => {
+        if (isTurnstileConfigured) {
+          setTurnstileToken(undefined);
+          turnstile.reset();
+        }
+      };
+      const normalizedEmail = data.email.toLowerCase();
+
       const createUserResponse = await createUserAction({
         name: data.name,
-        email: data.email,
+        email: normalizedEmail,
         password: data.password,
         userLocale,
         inviteToken: inviteToken ?? "",
@@ -119,37 +145,38 @@ export const SignupForm = ({
         subscribeToProductUpdates,
       });
 
-      const emailTokenActionResponse = await createEmailTokenAction({ email: data.email });
+      if (!createUserResponse?.data) {
+        resetTurnstileIfConfigured();
+
+        const errorMessage = getFormattedErrorMessage(createUserResponse);
+        // Personal-email block: surface under the email field rather than as a toast.
+        if (errorMessage === SIGNUP_EMAIL_DOMAIN_BLOCKED_ERROR_CODE) {
+          form.setError("email", { type: "manual", message: t("auth.signup.company_email_required") });
+        } else {
+          toast.error(errorMessage);
+        }
+        return;
+      }
+
+      const emailTokenActionResponse = await createEmailTokenAction({ email: normalizedEmail });
       const token = emailTokenActionResponse?.data;
+
+      if (!token) {
+        resetTurnstileIfConfigured();
+
+        const errorMessage = getFormattedErrorMessage(emailTokenActionResponse);
+        toast.error(errorMessage);
+        return;
+      }
 
       const url = emailVerificationDisabled
         ? `/auth/signup-without-verification-success?token=${token}`
         : buildVerificationRequestedPath({
-            token: token ?? "",
+            token,
             callbackUrl: inviteToken ? returnToUrl : undefined,
           });
 
-      if (createUserResponse?.data) {
-        router.push(url);
-
-        if (!emailTokenActionResponse?.data) {
-          if (isTurnstileConfigured) {
-            setTurnstileToken(undefined);
-            turnstile.reset();
-          }
-
-          const errorMessage = getFormattedErrorMessage(emailTokenActionResponse);
-          toast.error(errorMessage);
-        }
-      } else {
-        if (isTurnstileConfigured) {
-          setTurnstileToken(undefined);
-          turnstile.reset();
-        }
-
-        const errorMessage = getFormattedErrorMessage(createUserResponse);
-        toast.error(errorMessage);
-      }
+      router.push(url);
     } catch (e: any) {
       toast.error(e.message);
     }
@@ -312,8 +339,6 @@ export const SignupForm = ({
           oidcOAuthEnabled={oidcOAuthEnabled}
           oidcDisplayName={oidcDisplayName}
           samlSsoEnabled={samlSsoEnabled}
-          samlTenant={samlTenant}
-          samlProduct={samlProduct}
           returnToUrl={returnToUrl}
           source="signup"
         />
@@ -322,9 +347,7 @@ export const SignupForm = ({
       <div className="mt-9 text-center text-xs">
         <span className="leading-5 text-slate-500">{t("auth.signup.have_an_account")}</span>
         <br />
-        <Link
-          href={inviteToken ? `/auth/login?callbackUrl=${returnToUrl}` : "/auth/login"}
-          className="font-semibold text-slate-600 underline hover:text-slate-700">
+        <Link href={loginHref} className="font-semibold text-slate-600 underline hover:text-slate-700">
           {t("auth.signup.log_in")}
         </Link>
       </div>

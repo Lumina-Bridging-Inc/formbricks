@@ -1,5 +1,10 @@
 import { TFunction } from "i18next";
-import { TFeedbackSourceType, THubFieldType, ZHubFieldType } from "@formbricks/types/feedback-source";
+import {
+  TFeedbackSourceType,
+  THubFieldType,
+  UNSUPPORTED_FEEDBACK_SOURCE_ELEMENT_TYPES,
+  ZHubFieldType,
+} from "@formbricks/types/feedback-source";
 import {
   CSV_REQUIRED_UI_FIELDS,
   CSV_TARGET_FIELDS,
@@ -7,7 +12,18 @@ import {
   MAX_CSV_VALUES,
   TFieldMapping,
   TSourceField,
+  TUnifySurvey,
 } from "./types";
+
+export const getDismissedStorageKey = (workspaceId: string) => `${workspaceId}-dismissedFeedbackSuggestions`;
+
+/** Survey element ids that can be mapped to a feedback source (drops unsupported question types). */
+export const getSelectableQuestionIds = (survey: TUnifySurvey): string[] =>
+  survey.elements
+    .filter(
+      (element) => !(UNSUPPORTED_FEEDBACK_SOURCE_ELEMENT_TYPES as readonly string[]).includes(element.type)
+    )
+    .map((element) => element.id);
 
 export type TFeedbackSourceOptionId = TFeedbackSourceType | "api_ingestion" | "feedback_record_mcp";
 
@@ -36,13 +52,15 @@ export const getFeedbackSourceOptions = (t: TFunction): TFeedbackSourceOption[] 
     id: "api_ingestion",
     name: t("workspace.unify.api_ingestion"),
     description: t("workspace.unify.api_ingestion_settings_description"),
-    disabled: false,
+    disabled: true,
+    badge: { text: t("common.coming_soon"), type: "gray" },
   },
   {
     id: "feedback_record_mcp",
     name: t("workspace.unify.feedback_record_mcp"),
     description: t("workspace.unify.source_connect_feedback_record_mcp_description"),
-    disabled: false,
+    disabled: true,
+    badge: { text: t("common.coming_soon"), type: "gray" },
   },
 ];
 
@@ -230,28 +248,6 @@ interface TAutoMapInput {
   fileName: string;
 }
 
-const findBestSourceMatch = (
-  targetId: string,
-  sourceFields: TSourceField[]
-): { sourceField: TSourceField; confidence: TMappingConfidence } | null => {
-  const aliases = CSV_COLUMN_ALIASES[targetId];
-  if (!aliases) return null;
-
-  for (const pattern of aliases.high) {
-    const match = sourceFields.find((f) => pattern.test(f.name));
-    if (match) return { sourceField: match, confidence: "high" };
-  }
-  for (const pattern of aliases.medium) {
-    const match = sourceFields.find((f) => pattern.test(f.name));
-    if (match) return { sourceField: match, confidence: "medium" };
-  }
-  const idToken = targetId.split("_").pop() ?? targetId;
-  const fuzzy = sourceFields.find((f) => f.name.toLowerCase().includes(idToken.toLowerCase()));
-  if (fuzzy) return { sourceField: fuzzy, confidence: "low" };
-
-  return null;
-};
-
 export const autoMapCsvSourceFields = ({
   sourceFields,
   sampleRow,
@@ -263,11 +259,17 @@ export const autoMapCsvSourceFields = ({
 
   const orderedTargets = CSV_TARGET_FIELDS.map((t) => t.id);
 
+  // Binding a target to a column that has no data makes every row fail the transform (e.g. an
+  // empty "Zone ID" column auto-mapped to the required submission_id skips the whole import).
+  // Only auto-map columns that actually carry a value in the sample row; otherwise leave the
+  // target unmapped so the required-fields check forces an explicit, data-bearing choice.
+  const mappableFields = sourceFields.filter((f) => (sampleRow[f.id] ?? "").trim() !== "");
+
   for (const targetId of orderedTargets) {
     const aliases = CSV_COLUMN_ALIASES[targetId];
     if (!aliases) continue;
     for (const pattern of aliases.high) {
-      const match = sourceFields.find((f) => !claimedSources.has(f.id) && pattern.test(f.name));
+      const match = mappableFields.find((f) => !claimedSources.has(f.id) && pattern.test(f.name));
       if (match) {
         mappings.push({ targetFieldId: targetId, sourceFieldId: match.id });
         confidence[targetId] = "high";
@@ -282,24 +284,13 @@ export const autoMapCsvSourceFields = ({
     const aliases = CSV_COLUMN_ALIASES[targetId];
     if (!aliases) continue;
     for (const pattern of aliases.medium) {
-      const match = sourceFields.find((f) => !claimedSources.has(f.id) && pattern.test(f.name));
+      const match = mappableFields.find((f) => !claimedSources.has(f.id) && pattern.test(f.name));
       if (match) {
         mappings.push({ targetFieldId: targetId, sourceFieldId: match.id });
         confidence[targetId] = "medium";
         claimedSources.add(match.id);
         break;
       }
-    }
-  }
-
-  for (const targetId of orderedTargets) {
-    if (confidence[targetId]) continue;
-    const remaining = sourceFields.filter((f) => !claimedSources.has(f.id));
-    const guess = findBestSourceMatch(targetId, remaining);
-    if (guess && guess.confidence === "low") {
-      mappings.push({ targetFieldId: targetId, sourceFieldId: guess.sourceField.id });
-      confidence[targetId] = "low";
-      claimedSources.add(guess.sourceField.id);
     }
   }
 
@@ -336,6 +327,36 @@ export const autoMapCsvSourceFields = ({
   }
 
   return { mappings, confidence };
+};
+
+export const isCsvUserDefinedStaticValueMapping = (mapping: TFieldMapping | undefined | null): boolean =>
+  Boolean(mapping?.staticValue?.trim() && mapping.staticValue !== "$now");
+
+export type TCsvIdentityMappingAlert =
+  | { type: "both_fixed" }
+  | { type: "single_fixed"; field: "submission_id" | "field_id" };
+
+export const getCsvIdentityMappingAlert = (mappings: TFieldMapping[]): TCsvIdentityMappingAlert | null => {
+  const submissionIdFixed = isCsvUserDefinedStaticValueMapping(
+    mappings.find((mapping) => mapping.targetFieldId === "submission_id")
+  );
+  const fieldIdFixed = isCsvUserDefinedStaticValueMapping(
+    mappings.find((mapping) => mapping.targetFieldId === "field_id")
+  );
+
+  if (submissionIdFixed && fieldIdFixed) {
+    return { type: "both_fixed" };
+  }
+
+  if (submissionIdFixed) {
+    return { type: "single_fixed", field: "submission_id" };
+  }
+
+  if (fieldIdFixed) {
+    return { type: "single_fixed", field: "field_id" };
+  }
+
+  return null;
 };
 
 export const areAllRequiredCsvFieldsMapped = (

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 vi.mock("server-only", () => ({}));
 
 const mocks = {
-  getServerSession: vi.fn(),
+  getSession: vi.fn(),
   getOrganizationsByUserId: vi.fn(),
   getWorkspacesByUserId: vi.fn(),
   getMembershipByUserIdOrganizationId: vi.fn(),
@@ -15,10 +15,16 @@ const mocks = {
   getAccessControlPermission: vi.fn(),
   getOrganizationWorkspacesLimit: vi.fn(),
   getPublicDomain: vi.fn(),
+  cookieGet: vi.fn(),
 };
 
-vi.mock("next-auth", () => ({ getServerSession: (...args: unknown[]) => mocks.getServerSession(...args) }));
-vi.mock("@/modules/auth/lib/authOptions", () => ({ authOptions: {} }));
+vi.mock("next/headers", () => ({
+  cookies: () => Promise.resolve({ get: (name: string) => mocks.cookieGet(name) }),
+}));
+
+vi.mock("@/modules/auth/lib/session", () => ({
+  getSession: (...args: unknown[]) => mocks.getSession(...args),
+}));
 vi.mock("@/lib/constants", () => ({ IS_FORMBRICKS_CLOUD: true, IS_DEVELOPMENT: false }));
 vi.mock("@/lib/getPublicUrl", () => ({ getPublicDomain: () => mocks.getPublicDomain() }));
 vi.mock("@/app/(app)/workspaces/[workspaceId]/lib/organization", () => ({
@@ -47,7 +53,7 @@ vi.mock("@/modules/ee/license-check/lib/utils", () => ({
 const { getSettingsLayoutData } = await import("./navigation-data");
 
 const seedSuccess = () => {
-  mocks.getServerSession.mockResolvedValue({ user: { id: "user-1" } });
+  mocks.getSession.mockResolvedValue({ user: { id: "user-1" } });
   mocks.getUser.mockResolvedValue({ id: "user-1", name: "Test" });
   mocks.getOrganization.mockResolvedValue({ id: "org-1", name: "Org", billing: {} });
   mocks.getMembershipByUserIdOrganizationId.mockResolvedValue({ role: "owner" });
@@ -56,18 +62,20 @@ const seedSuccess = () => {
   mocks.getOrganizationWorkspacesLimit.mockResolvedValue(3);
   mocks.getMonthlyOrganizationResponseCount.mockResolvedValue(42);
   mocks.getPublicDomain.mockReturnValue("https://app.formbricks.com");
+  // No active-workspace cookie by default.
+  mocks.cookieGet.mockReturnValue(undefined);
 };
 
 describe("getSettingsLayoutData", () => {
   afterEach(() => vi.clearAllMocks());
 
   test("returns null when there is no session", async () => {
-    mocks.getServerSession.mockResolvedValue(null);
+    mocks.getSession.mockResolvedValue(null);
     expect(await getSettingsLayoutData("user-1")).toBeNull();
   });
 
   test("returns null when no organization can be resolved", async () => {
-    mocks.getServerSession.mockResolvedValue({ user: { id: "user-1" } });
+    mocks.getSession.mockResolvedValue({ user: { id: "user-1" } });
     mocks.getOrganizationsByUserId.mockResolvedValue([]);
     expect(await getSettingsLayoutData("user-1")).toBeNull();
   });
@@ -95,5 +103,29 @@ describe("getSettingsLayoutData", () => {
 
     expect(data?.currentWorkspace).toBeNull();
     expect(data?.backUrl).toBe("/");
+  });
+
+  test("uses the active-workspace cookie when it is in the accessible list", async () => {
+    seedSuccess();
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-1" }, { id: "ws-2" }]);
+    mocks.getWorkspace.mockImplementation((id: string) => Promise.resolve({ id, name: "WS" }));
+    mocks.cookieGet.mockReturnValue({ value: "ws-2" });
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(data?.currentWorkspace?.id).toBe("ws-2");
+    expect(data?.backUrl).toBe("/workspaces/ws-2/surveys");
+  });
+
+  test("ignores the cookie and falls back to the first workspace when it is not accessible", async () => {
+    seedSuccess();
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-1" }, { id: "ws-2" }]);
+    mocks.getWorkspace.mockImplementation((id: string) => Promise.resolve({ id, name: "WS" }));
+    mocks.cookieGet.mockReturnValue({ value: "ws-not-mine" });
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(data?.currentWorkspace?.id).toBe("ws-1");
+    expect(data?.backUrl).toBe("/workspaces/ws-1/surveys");
   });
 });

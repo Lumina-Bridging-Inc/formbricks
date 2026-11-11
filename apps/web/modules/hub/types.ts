@@ -1,10 +1,30 @@
 import type FormbricksHub from "@formbricks/hub";
 
-export type FeedbackRecordCreateParams = FormbricksHub.FeedbackRecordCreateParams;
-export type FeedbackRecordData = FormbricksHub.FeedbackRecordData;
+// value_id (ENG-1671/ENG-1673): stable id of the selected option in the source system (a survey
+// choice id for Formbricks responses). Lets Hub consolidate the same option across languages
+// instead of splitting it per localized label. The published SDK predates the field, so bridge
+// it as an optional param until the SDK ships it.
+export type FeedbackRecordCreateParams = FormbricksHub.FeedbackRecordCreateParams & {
+  value_id?: string;
+};
 export type FeedbackRecordListParams = FormbricksHub.FeedbackRecordListParams;
-export type FeedbackRecordListResponse = FormbricksHub.FeedbackRecordListResponse;
 export type FeedbackRecordUpdateParams = FormbricksHub.FeedbackRecordUpdateParams;
+
+// Hub-derived, read-only translation fields (ENG-1255). The published SDK predates them, so bridge
+// them as optional reads; drop once the SDK ships them. May be null when translation is off/pending.
+// `emotions` is a read-only enrichment field that also predates the SDK type (the DB column is a
+// Postgres text[]); absent until a record is enriched. Typed to accept either the serialized array
+// or a comma-joined string, since the serialization is owned by the external hub service.
+export type FeedbackRecordData = FormbricksHub.FeedbackRecordData & {
+  value_text_translated?: string | null;
+  translation_lang_key?: string | null;
+  value_id?: string | null;
+  emotions?: string[] | string | null;
+};
+
+export type FeedbackRecordListResponse = Omit<FormbricksHub.FeedbackRecordListResponse, "data"> & {
+  data: FeedbackRecordData[];
+};
 
 export type SemanticSearchInput = FormbricksHub.FeedbackRecords.SearchPerformSemanticSearchParams;
 export type SemanticSearchResponse = FormbricksHub.FeedbackRecords.SearchPerformSemanticSearchResponse;
@@ -15,6 +35,21 @@ export type TaxonomyScope = {
   source_type: string;
   source_id: string;
   field_id: string;
+};
+
+export type TaxonomyScopeType = "field" | "directory";
+
+/**
+ * Scope used to address taxonomy reads/writes. `field` scope carries source/field; `directory` scope
+ * (`scope_type: "directory"`) covers all text feedback in the tenant and omits source/field entirely
+ * (the Hub rejects source/field params for directory scope).
+ */
+export type TaxonomyScopeInput = {
+  tenant_id: string;
+  scope_type?: TaxonomyScopeType;
+  source_type?: string;
+  source_id?: string;
+  field_id?: string;
 };
 
 export type TaxonomyFieldOption = TaxonomyScope & {
@@ -35,6 +70,7 @@ export type TaxonomyRunFailureCode =
 
 export type TaxonomyRun = TaxonomyScope & {
   id: string;
+  scope_type?: TaxonomyScopeType;
   field_label?: string;
   status: TaxonomyRunStatus;
   params?: Record<string, unknown>;
@@ -74,7 +110,7 @@ export type TaxonomyFieldsResponse = {
   data: TaxonomyFieldOption[];
 };
 
-export type CreateTaxonomyRunInput = TaxonomyScope & {
+export type CreateTaxonomyRunInput = TaxonomyScopeInput & {
   field_label?: string;
   actor_id?: string;
 };
@@ -102,4 +138,15 @@ export type RenameTaxonomyNodeInput = {
 export type TaxonomyNodeRecordsResponse = {
   data: FeedbackRecordData[];
   limit: number;
+};
+
+/** Distinct feedback-record count for a taxonomy node's subtree (node + its visible descendants). */
+export type TaxonomyNodeRecordCount = {
+  node_id: string;
+  record_count: number;
+};
+
+/** Per-node record counts for a taxonomy run — one entry per visible node, subtree totals. */
+export type TaxonomyRecordCountsResponse = {
+  counts: TaxonomyNodeRecordCount[];
 };

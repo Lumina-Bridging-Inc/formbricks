@@ -5,6 +5,7 @@ import { z } from "zod";
 import { ZWidgetLayout } from "@formbricks/types/analysis";
 import { ZId } from "@formbricks/types/common";
 import { OperationNotAllowedError } from "@formbricks/types/errors";
+import { capturePostHogEvent } from "@/lib/posthog";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
 import { AuthenticatedActionClientCtx } from "@/lib/utils/action-client/types/context";
 import { checkWorkspaceAccess } from "@/modules/ee/analysis/lib/access";
@@ -22,6 +23,7 @@ import {
   updateDashboard,
   updateWidgetLayouts,
 } from "./lib/dashboards";
+import { duplicateChartAndAddWidget } from "./lib/duplicate-chart-and-add-widget";
 
 const checkDashboardsEnabled = async (organizationId: string) => {
   const isAllowed = await getIsDashboardsEnabled(organizationId);
@@ -65,6 +67,12 @@ export const createDashboardAction = authenticatedActionClient.inputSchema(ZCrea
       ctx.auditLoggingCtx.workspaceId = workspaceId;
       ctx.auditLoggingCtx.dashboardId = dashboard.id;
       ctx.auditLoggingCtx.newObject = dashboard;
+      capturePostHogEvent(
+        ctx.user.id,
+        "dashboard_created",
+        { dashboard_id: dashboard.id },
+        { organizationId, workspaceId }
+      );
       return dashboard;
     }
   )
@@ -146,6 +154,8 @@ export const updateWidgetLayoutsAction = authenticatedActionClient
         await updateWidgetLayouts(parsedInput.dashboardId, workspaceId, parsedInput.widgets);
 
         const updatedDashboard = await getDashboard(parsedInput.dashboardId, workspaceId);
+
+        revalidatePath(`/workspaces/${workspaceId}/dashboards/${parsedInput.dashboardId}`);
 
         ctx.auditLoggingCtx.organizationId = organizationId;
         ctx.auditLoggingCtx.workspaceId = workspaceId;
@@ -311,10 +321,61 @@ export const addChartToDashboardAction = authenticatedActionClient
           respectY: parsedInput.respectY,
         });
 
+        revalidatePath(`/workspaces/${workspaceId}/dashboards/${parsedInput.dashboardId}`);
+        revalidatePath(`/workspaces/${workspaceId}/dashboards`);
+
         ctx.auditLoggingCtx.organizationId = organizationId;
         ctx.auditLoggingCtx.workspaceId = workspaceId;
         ctx.auditLoggingCtx.dashboardWidgetId = widget.id;
         ctx.auditLoggingCtx.newObject = widget;
+        return widget;
+      }
+    )
+  );
+
+const ZDuplicateChartAndAddWidgetAction = z.object({
+  workspaceId: ZId,
+  dashboardId: ZId,
+  chartId: ZId,
+  layout: ZWidgetLayout.optional(),
+});
+
+export const duplicateChartAndAddWidgetAction = authenticatedActionClient
+  .inputSchema(ZDuplicateChartAndAddWidgetAction)
+  .action(
+    withAuditLogging(
+      "created",
+      "dashboardWidget",
+      async ({
+        ctx,
+        parsedInput,
+      }: {
+        ctx: AuthenticatedActionClientCtx;
+        parsedInput: z.infer<typeof ZDuplicateChartAndAddWidgetAction>;
+      }) => {
+        const { organizationId, workspaceId } = await checkWorkspaceAccess(
+          ctx.user.id,
+          parsedInput.workspaceId,
+          "readWrite"
+        );
+        await checkDashboardsEnabled(organizationId);
+
+        const { chart, widget } = await duplicateChartAndAddWidget({
+          dashboardId: parsedInput.dashboardId,
+          workspaceId,
+          chartId: parsedInput.chartId,
+          createdBy: ctx.user.id,
+          layout: parsedInput.layout,
+        });
+
+        revalidatePath(`/workspaces/${workspaceId}/dashboards/${parsedInput.dashboardId}`);
+        revalidatePath(`/workspaces/${workspaceId}/dashboards`);
+
+        ctx.auditLoggingCtx.organizationId = organizationId;
+        ctx.auditLoggingCtx.workspaceId = workspaceId;
+        ctx.auditLoggingCtx.chartId = chart.id;
+        ctx.auditLoggingCtx.dashboardWidgetId = widget.id;
+        ctx.auditLoggingCtx.newObject = { chart, widget };
         return widget;
       }
     )
@@ -342,6 +403,9 @@ export const removeWidgetFromDashboardAction = authenticatedActionClient
         workspaceId,
         parsedInput.widgetId
       );
+
+      revalidatePath(`/workspaces/${workspaceId}/dashboards/${parsedInput.dashboardId}`);
+      revalidatePath(`/workspaces/${workspaceId}/dashboards`);
 
       ctx.auditLoggingCtx.organizationId = organizationId;
       ctx.auditLoggingCtx.workspaceId = workspaceId;

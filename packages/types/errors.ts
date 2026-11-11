@@ -187,6 +187,21 @@ export const EXPECTED_ERROR_NAMES = new Set([
  */
 export const isExpectedError = (error: Error): boolean => EXPECTED_ERROR_NAMES.has(error.name);
 
+/**
+ * Stable, locale-independent marker placed in an ApiErrorResponse's `details.code` when a
+ * response update is rejected because the response was already finalized. Clients key off this
+ * instead of the human-readable (and potentially localized/reworded) error message.
+ */
+export const RESPONSE_ALREADY_FINISHED_ERROR_CODE = "response_already_finished";
+
+/**
+ * Stable, locale-independent marker used when a Formbricks Cloud sign-up is rejected because the
+ * email uses a personal/free/disposable domain. Reused as the sign-up action's `serverError`
+ * sentinel and as the `?error=` code on the SSO rejection redirect, so the client can map it to a
+ * localized message without depending on the (server-only) blocklist utility.
+ */
+export const SIGNUP_EMAIL_DOMAIN_BLOCKED_ERROR_CODE = "email_domain_not_allowed";
+
 export interface ApiErrorResponse {
   code:
     | "not_found"

@@ -1,25 +1,32 @@
 "use server";
 
+import { cookies } from "next/headers";
 import { z } from "zod";
 import { logger } from "@formbricks/logger";
-import { InvalidInputError, UnknownError } from "@formbricks/types/errors";
-import { ZUser, ZUserEmail, ZUserLocale, ZUserName, ZUserPassword } from "@formbricks/types/user";
-import { hashPassword } from "@/lib/auth";
 import {
-  EMAIL_VERIFICATION_DISABLED,
-  IS_FORMBRICKS_CLOUD,
-  IS_TURNSTILE_CONFIGURED,
-  TURNSTILE_SECRET_KEY,
-} from "@/lib/constants";
+  InvalidInputError,
+  SIGNUP_EMAIL_DOMAIN_BLOCKED_ERROR_CODE,
+  UnknownError,
+} from "@formbricks/types/errors";
+import { ZUser, ZUserEmail, ZUserLocale, ZUserName, ZUserPassword } from "@formbricks/types/user";
+import { IS_FORMBRICKS_CLOUD, IS_TURNSTILE_CONFIGURED, TURNSTILE_SECRET_KEY } from "@/lib/constants";
 import { verifyInviteToken } from "@/lib/jwt";
 import { createMembership } from "@/lib/membership/service";
 import { createOrganization, getOrganization } from "@/lib/organization/service";
-import { capturePostHogEvent, groupIdentifyPostHog } from "@/lib/posthog";
+import { capturePostHogEvent, groupIdentifyPostHog, identifyPostHogPerson } from "@/lib/posthog";
+import { getUserByEmail } from "@/lib/user/service";
 import { actionClient } from "@/lib/utils/action-client";
 import { ActionClientCtx } from "@/lib/utils/action-client/types/context";
 import { DEFAULT_WORKSPACE_NAME } from "@/lib/workspace/constants";
-import { createUser, updateUser } from "@/modules/auth/lib/user";
-import { deleteInvite, getInvite } from "@/modules/auth/signup/lib/invite";
+import { ATTRIBUTION_COOKIE_NAME, getAttributionPropertiesFromCookies } from "@/modules/auth/lib/attribution";
+import { auth } from "@/modules/auth/lib/auth";
+import { isSignupEmailDomainBlocked } from "@/modules/auth/lib/signup-email-domain";
+import {
+  markSignupDomainAllowed,
+  runWithSignupRequestContext,
+} from "@/modules/auth/lib/signup-request-context";
+import { updateUser } from "@/modules/auth/lib/user";
+import { deleteInvite, getInvite, resolveInviteMatch } from "@/modules/auth/signup/lib/invite";
 import { createTeamMembership } from "@/modules/auth/signup/lib/team";
 import { verifyTurnstileToken } from "@/modules/auth/signup/lib/utils";
 import { applyIPRateLimit } from "@/modules/core/rate-limit/helpers";
@@ -28,7 +35,7 @@ import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
 import { ensureCloudStripeSetupForOrganization } from "@/modules/ee/billing/lib/organization-billing";
 import { getIsMultiOrgEnabled } from "@/modules/ee/license-check/lib/utils";
 import { subscribeUserToMailingList } from "@/modules/ee/mailing/lib/mailing-subscription";
-import { sendInviteAcceptedEmail, sendVerificationEmail } from "@/modules/email";
+import { sendInviteAcceptedEmail } from "@/modules/email";
 import { createWorkspace } from "@/modules/workspaces/settings/lib/workspace";
 
 const ZCreatedUser = ZUser.pick({
@@ -71,31 +78,45 @@ async function verifyTurnstileIfConfigured(turnstileToken: string | undefined): 
   }
 }
 
-async function createUserSafely(
+async function signUpUserSafely(
   email: string,
   name: string,
-  hashedPassword: string,
+  password: string,
   userLocale: z.infer<typeof ZUserLocale> | undefined
 ): Promise<{ user: TCreatedUser | undefined; userAlreadyExisted: boolean }> {
-  let user: TCreatedUser | undefined = undefined;
-  let userAlreadyExisted = false;
+  const normalizedEmail = email.toLowerCase();
 
   try {
-    user = await createUser({
-      email: email.toLowerCase(),
-      name,
-      password: hashedPassword,
-      locale: userLocale,
-    });
+    // Better Auth-native signup: creates the User + a bcrypt credential Account (via the password hook
+    // in auth.ts) and, when verification is enabled, sends Better Auth's verification email (sendOnSignUp;
+    // callbackURL defaults to "/"). We deliberately do NOT pass a /invite callbackURL for invite signups:
+    // the invite is accepted and deleted in handlePostUserCreation right after this, so by the time the
+    // verification link is clicked /invite would render "Invite Not Found" (ENG-1527) — the verified,
+    // already-provisioned user lands on the app home instead. Replaces the manual hash + createUser + the
+    // legacy verification-token email.
+    await auth.api.signUpEmail({ body: { email: normalizedEmail, password, name } });
   } catch (error) {
-    if (error instanceof InvalidInputError) {
-      userAlreadyExisted = true;
-    } else {
-      throw error;
+    // Enumeration-safe: a duplicate email resolves to "already existed", not a surfaced error.
+    const existing = await getUserByEmail(normalizedEmail);
+    if (existing) {
+      return { user: existing, userAlreadyExisted: true };
     }
+    throw error;
   }
 
-  return { user, userAlreadyExisted };
+  let user = await getUserByEmail(normalizedEmail);
+  if (!user) {
+    // signUpEmail succeeded but the row can't be loaded — an invariant violation. Fail loud rather
+    // than returning { success: true } with no user, which would skip org creation / invite acceptance.
+    throw new UnknownError("Failed to load user after signup");
+  }
+  // signUpEmail can't carry the chosen locale (not a Better Auth field), so apply it afterwards.
+  if (userLocale && user.locale !== userLocale) {
+    await updateUser(user.id, { locale: userLocale });
+    user = { ...user, locale: userLocale };
+  }
+
+  return { user, userAlreadyExisted: false };
 }
 
 async function handleInviteAcceptance(
@@ -225,18 +246,9 @@ async function handlePostUserCreation(
   } else {
     await handleOrganizationCreation(ctx, user);
   }
-
-  if (!EMAIL_VERIFICATION_DISABLED) {
-    // Do NOT point the post-verification callback back at /invite for invite signups: the invite is
-    // already accepted and deleted in handleInviteAcceptance above, so /invite would render
-    // "Invite Not Found" (ENG-1527). Leaving callbackUrl undefined lands the freshly verified —
-    // and already provisioned — user on the app home instead.
-    await sendVerificationEmail({
-      id: user.id,
-      email: user.email,
-      locale: user.locale,
-    });
-  }
+  // Better Auth sends the verification email itself during signUpEmail (sendOnSignUp) — no manual
+  // send here. The legacy EMAIL_VERIFICATION_DISABLED branch (ENG-1527) is folded into auth.ts'
+  // requireEmailVerification config and the callbackURL chosen in signUpUserSafely.
 }
 
 export const createUserAction = actionClient.inputSchema(ZCreateUserAction).action(
@@ -244,13 +256,29 @@ export const createUserAction = actionClient.inputSchema(ZCreateUserAction).acti
     await applyIPRateLimit(rateLimitConfigs.auth.signup);
     await verifyTurnstileIfConfigured(parsedInput.turnstileToken);
 
-    const hashedPassword = await hashPassword(parsedInput.password);
-    const { user, userAlreadyExisted } = await createUserSafely(
-      parsedInput.email,
-      parsedInput.name,
-      hashedPassword,
-      parsedInput.userLocale
-    );
+    // Formbricks Cloud only: reject personal/free/disposable email domains before any user is created.
+    // Invited users are exempt unless SIGNUP_DOMAIN_CHECK_ON_INVITES is enabled.
+    if (
+      await isSignupEmailDomainBlocked(
+        parsedInput.email,
+        async () => (await resolveInviteMatch(parsedInput.inviteToken, parsedInput.email)) === "valid"
+      )
+    ) {
+      throw new InvalidInputError(SIGNUP_EMAIL_DOMAIN_BLOCKED_ERROR_CODE);
+    }
+
+    // The domain policy passed, so mark the request scope: user.create.before uses this to tell a
+    // sign-up that went through this action apart from a direct POST to Better Auth's native
+    // /sign-up/email endpoint (which bypasses the action and is re-checked in the hook).
+    const { user, userAlreadyExisted } = await runWithSignupRequestContext(() => {
+      markSignupDomainAllowed();
+      return signUpUserSafely(
+        parsedInput.email,
+        parsedInput.name,
+        parsedInput.password,
+        parsedInput.userLocale
+      );
+    });
 
     if (!userAlreadyExisted && user) {
       await handlePostUserCreation(ctx, user, parsedInput.inviteToken);
@@ -262,10 +290,17 @@ export const createUserAction = actionClient.inputSchema(ZCreateUserAction).acti
         subscribeToProductUpdates: parsedInput.subscribeToProductUpdates,
       });
 
+      const cookieStore = await cookies();
+      const hasAttributionCookie = cookieStore.get(ATTRIBUTION_COOKIE_NAME) !== undefined;
+      const attributionProperties = getAttributionPropertiesFromCookies(cookieStore);
+
+      identifyPostHogPerson(user.id, { email: user.email, name: user.name });
       capturePostHogEvent(
         user.id,
         "user_signed_up",
         {
+          // Spread attribution first so trusted, server-computed props always win on a name clash.
+          ...attributionProperties,
           auth_provider: "credentials",
           email_domain: user.email.split("@")[1],
           signup_source: parsedInput.inviteToken ? "invite" : "direct",
@@ -275,6 +310,16 @@ export const createUserAction = actionClient.inputSchema(ZCreateUserAction).acti
           ? { organizationId: ctx.auditLoggingCtx.organizationId }
           : undefined
       );
+
+      // Clear whenever a cookie is present (even malformed/empty) so it cannot bleed onto
+      // later events and a stale/legacy value cannot block future first-touch capture.
+      if (hasAttributionCookie) {
+        try {
+          cookieStore.delete(ATTRIBUTION_COOKIE_NAME);
+        } catch {
+          // Best-effort; the short cookie lifetime is the backstop.
+        }
+      }
     }
 
     if (user) {

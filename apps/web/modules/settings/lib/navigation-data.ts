@@ -1,17 +1,18 @@
 import "server-only";
-import { getServerSession } from "next-auth";
-import type { Session } from "next-auth";
+import { cookies } from "next/headers";
+import type { Session } from "@formbricks/types/auth";
 import type { TOrganizationRole } from "@formbricks/types/memberships";
 import type { TWorkspace } from "@formbricks/types/workspace";
 import { getOrganizationsByUserId } from "@/app/(app)/workspaces/[workspaceId]/lib/organization";
 import { getWorkspacesByUserId } from "@/app/(app)/workspaces/[workspaceId]/lib/workspace";
 import { IS_DEVELOPMENT, IS_FORMBRICKS_CLOUD } from "@/lib/constants";
 import { getPublicDomain } from "@/lib/getPublicUrl";
+import { FORMBRICKS_WORKSPACE_ID_COOKIE } from "@/lib/localStorage";
 import { getMembershipByUserIdOrganizationId } from "@/lib/membership/service";
 import { getMonthlyOrganizationResponseCount, getOrganization } from "@/lib/organization/service";
 import { getUser } from "@/lib/user/service";
 import { getWorkspace } from "@/lib/workspace/service";
-import { authOptions } from "@/modules/auth/lib/authOptions";
+import { getSession } from "@/modules/auth/lib/session";
 import { getEnterpriseLicense } from "@/modules/ee/license-check/lib/license";
 import {
   getAccessControlPermission,
@@ -51,12 +52,17 @@ export interface TSettingsLayoutData {
  *
  * `organizationId` is optional — account settings don't carry one, so we default to the user's first
  * organization.
+ *
+ * The "current" workspace is resolved from the `formbricks-workspace-id` cookie (set by the proxy from
+ * the last visited `/workspaces/[workspaceId]` path), so navigating into the workspace-agnostic
+ * org-settings routes keeps the workspace you came from. If the cookie is missing or points at a
+ * workspace the user can't access, it falls back to the first accessible workspace.
  */
 export const getSettingsLayoutData = async (
   userId: string,
   organizationId?: string
 ): Promise<TSettingsLayoutData | null> => {
-  const session = await getServerSession(authOptions);
+  const session = await getSession();
   if (!session?.user) return null;
 
   let orgId = organizationId;
@@ -82,8 +88,18 @@ export const getSettingsLayoutData = async (
 
   const responseCount = IS_FORMBRICKS_CLOUD ? await getMonthlyOrganizationResponseCount(organization.id) : 0;
 
+  // Resolve the workspace to display in the shell. Prefer the last active workspace (from the
+  // formbricks-workspace-id cookie the proxy sets on /workspaces/[workspaceId] visits) when it
+  // belongs to the accessible list; otherwise fall back to the first accessible workspace so the
+  // shell always has something to show.
+  const cookieStore = await cookies();
+  const preferredWorkspaceId = cookieStore.get(FORMBRICKS_WORKSPACE_ID_COOKIE)?.value;
+  const resolvedWorkspaceId =
+    preferredWorkspaceId && workspaces.some((w) => w.id === preferredWorkspaceId)
+      ? preferredWorkspaceId
+      : workspaces[0]?.id;
   // Full workspace object (not just id/name) so the shell can supply the WorkspaceContext.
-  const currentWorkspace = workspaces[0] ? await getWorkspace(workspaces[0].id) : null;
+  const currentWorkspace = resolvedWorkspaceId ? await getWorkspace(resolvedWorkspaceId) : null;
   const isOwnerOrManager = membership.role === "owner" || membership.role === "manager";
 
   return {

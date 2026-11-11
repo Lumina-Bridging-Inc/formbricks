@@ -17,7 +17,6 @@
   color utility to any element that depends on these defaults.
 */
 @layer base {
-
   #fbjs *,
   #fbjs ::after,
   #fbjs ::before,
@@ -26,7 +25,6 @@
     border-color: var(--color-gray-200, currentcolor);
   }
 }
-
 
 /* Chrome, Edge, and Safari */
 #fbjs *::-webkit-scrollbar {
@@ -52,9 +50,27 @@
 
 /* this is for styling the HtmlBody component */
 #fbjs .htmlbody {
-  @apply block text-sm font-normal leading-6;
+  @apply block text-sm leading-6 font-normal;
   /* need to use !important because in packages/survey-ui/components/editor/styles-editor-frontend.css the color is defined for some classes */
   color: var(--fb-subheading-color) !important;
+}
+
+/*
+ * Keep bold (<strong>/<b>) inside rich text actually bold. The headline /
+ * description font-weight rules injected by styles.ts target every descendant
+ * (`.label-headline *`), which would otherwise flatten bold spans to the base
+ * weight and erase the contrast between bold and non-bold text. Higher
+ * specificity + !important wins over those runtime rules.
+ */
+#fbjs .label-headline strong,
+#fbjs .label-headline b,
+#fbjs .label-description strong,
+#fbjs .label-description b,
+#fbjs .text-subheading strong,
+#fbjs .text-subheading b,
+#fbjs .htmlbody strong,
+#fbjs .htmlbody b {
+  font-weight: 700 !important;
 }
 
 /*
@@ -122,8 +138,10 @@
   --fb-subheading-color: var(--slate-700);
   --fb-placeholder-color: var(--slate-300);
   --fb-info-text-color: var(--slate-500);
-  --fb-signature-text-color: var(--slate-500);
-  --fb-branding-text-color: var(--slate-500);
+  /* slate-600, not slate-500: the branding line is 12px text and slate-500 on a white
+     card is 4.42:1 — just under the WCAG 1.4.3 AA 4.5:1 threshold (axe color-contrast). */
+  --fb-signature-text-color: var(--slate-600);
+  --fb-branding-text-color: var(--slate-600);
   --fb-survey-background-color: white;
   --fb-survey-border-color: var(--slate-50);
   --fb-accent-background-color: var(--slate-200);
