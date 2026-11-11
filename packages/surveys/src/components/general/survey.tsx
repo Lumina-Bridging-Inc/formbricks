@@ -113,11 +113,12 @@ export function Survey({
   isSpamProtectionEnabled,
   dir = "auto",
   setDir,
+  onLanguageChange,
   placement,
   offlineSupport = false,
   onOfflineStatusChange,
   showCardlessPreviewLogoSlot = false,
-}: SurveyContainerProps) {
+}: Readonly<SurveyContainerProps>) {
   const workspaceId = workspaceIdProp ?? environmentId;
   let apiClient: ApiClient | null = null;
 
@@ -251,6 +252,11 @@ export function Survey({
 
     return localSurvey.blocks[0]?.id;
   });
+
+  // True once the user navigated between cards (Next/Back/auto-progress). Moving focus into
+  // the new card is then a response to a user action (safe under WCAG 3.2.x), unlike the
+  // initial render of an embedded survey, where stealing focus from the host page is not.
+  const hasUserNavigatedRef = useRef(false);
 
   const [errorType, setErrorType] = useState<TResponseErrorCodesEnum | undefined>(undefined);
   const [showError, setShowError] = useState(false);
@@ -438,6 +444,13 @@ export function Survey({
   useEffect(() => {
     setSelectedLanguage(languageCode);
   }, [languageCode]);
+
+  // Report the active language (initial value + every switch) so a link-survey
+  // host can keep the page lang/dir in sync (WCAG 3.1.1). Embedded widgets pass
+  // no callback, so the host page is never touched.
+  useEffect(() => {
+    onLanguageChange?.(selectedLanguage);
+  }, [selectedLanguage, onLanguageChange]);
 
   // --- Offline support: restore progress from IndexedDB on mount ---
   useEffect(() => {
@@ -925,8 +938,19 @@ export function Survey({
     }
   }, [isResponseSendingFinished, isSurveyFinished, onFinished]);
 
+  // The outgoing card stays visible while the card transition cross-fades, so a
+  // control that kept focus would show its focus ring hanging mid-fade before
+  // vanishing with the card. Drop focus when navigation starts; the incoming
+  // card focuses its first control on mount.
+  const blurOutgoingCard = (): void => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) active.blur();
+  };
+
   const onSubmit = async (surveyResponseData: TResponseData, responsettc: TResponseTtc) => {
     isNavigatingBackRef.current = false;
+    hasUserNavigatedRef.current = true;
+    blurOutgoingCard();
 
     // Get the first responded element ID for tracking
     const respondedElementIds = Object.keys(surveyResponseData);
@@ -948,14 +972,23 @@ export function Survey({
 
     pushVariableState(firstRespondedElementId);
 
-    const { nextBlockId, calculatedVariables } = evaluateLogicAndGetNextBlockId(surveyResponseData);
+    const { nextBlockId: rawNextBlockId, calculatedVariables } =
+      evaluateLogicAndGetNextBlockId(surveyResponseData);
+    // A jump target may reference a deleted block or ending; treat such stale ids as "no target"
+    // so the shown ending and the persisted endingId stay in sync
+    const targetIsBlock = localSurvey.blocks.some((block) => block.id === rawNextBlockId);
+    const targetIsEnding = localSurvey.endings.some((ending) => ending.id === rawNextBlockId);
+    const isValidTarget = targetIsBlock || targetIsEnding;
+    const nextBlockId = isValidTarget ? rawNextBlockId : undefined;
     const finished =
       nextBlockId === undefined || !localSurvey.blocks.map((block) => block.id).includes(nextBlockId);
 
     setIsSurveyFinished(finished);
 
-    const endingId = nextBlockId
-      ? localSurvey.endings.find((ending) => ending.id === nextBlockId)?.id
+    // The ending that will be shown: an explicit jump target, or the first ending when the survey
+    // falls off the last block (mirrors the display fallback below so the persisted endingId matches it)
+    const endingId = finished
+      ? (localSurvey.endings.find((ending) => ending.id === nextBlockId)?.id ?? localSurvey.endings[0]?.id)
       : undefined;
 
     onChange(surveyResponseData);
@@ -1016,6 +1049,8 @@ export function Survey({
 
   const onBack = (): void => {
     isNavigatingBackRef.current = true;
+    hasUserNavigatedRef.current = true;
+    blurOutgoingCard();
 
     let prevBlockId: string | undefined;
     // use history if available
@@ -1081,6 +1116,8 @@ export function Survey({
           );
         case TResponseErrorCodesEnum.RecaptchaError:
         case TResponseErrorCodesEnum.InvalidDeviceError:
+        case TResponseErrorCodesEnum.ResponseAlreadyCompleted:
+        case TResponseErrorCodesEnum.ResponseSendingErrorPermanent:
           return (
             <>
               {localSurvey.type !== "link" ? (
@@ -1114,7 +1151,7 @@ export function Survey({
             survey={localSurvey}
             languageCode={selectedLanguage}
             responseCount={responseCount}
-            autoFocusEnabled={autoFocusEnabled}
+            autoFocusEnabled={autoFocusEnabled || hasUserNavigatedRef.current}
             isCurrent={offset === 0}
             responseData={responseData}
             variablesData={currentVariables}
@@ -1133,7 +1170,7 @@ export function Survey({
               survey={localSurvey}
               endingCard={endingCard}
               isRedirectDisabled={isRedirectDisabled}
-              autoFocusEnabled={autoFocusEnabled}
+              autoFocusEnabled={autoFocusEnabled || hasUserNavigatedRef.current}
               isCurrent={offset === 0}
               languageCode={selectedLanguage}
               isResponseSendingFinished={isResponseSendingFinished}
@@ -1174,6 +1211,7 @@ export function Survey({
               isLastBlock={block.id === localSurvey.blocks[localSurvey.blocks.length - 1].id}
               languageCode={selectedLanguage}
               autoFocusEnabled={autoFocusEnabled}
+              shouldFocusOnMount={autoFocusEnabled || hasUserNavigatedRef.current}
               isBackButtonHidden={localSurvey.isBackButtonHidden}
               isAutoProgressingEnabled={localSurvey.isAutoProgressingEnabled}
               onOpenExternalURL={onOpenExternalURL}

@@ -7,15 +7,12 @@ import { ZId } from "@formbricks/types/common";
 import { AuthorizationError, InvalidInputError, ResourceNotFoundError } from "@formbricks/types/errors";
 import {
   TFeedbackSourceWithMappings,
-  THubFieldType,
   ZFeedbackSourceCreateInput,
   ZFeedbackSourceFieldMappingCreateInput,
   ZFeedbackSourceUpdateInput,
-  getHubFieldTypeFromElementType,
 } from "@formbricks/types/feedback-source";
 import { getResponseCountBySurveyId } from "@/lib/response/service";
 import { getSurvey } from "@/lib/survey/service";
-import { getElementsFromBlocks } from "@/lib/survey/utils";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
 import { checkAuthorizationUpdated } from "@/lib/utils/action-client/action-client-middleware";
 import { AuthenticatedActionClientCtx } from "@/lib/utils/action-client/types/context";
@@ -25,16 +22,16 @@ import {
   getOrganizationIdFromWorkspaceId,
 } from "@/lib/utils/helper";
 import { getFeedbackDirectoriesByWorkspaceId } from "@/modules/ee/feedback-directory/lib/feedback-directory";
+import { getContactIdsByUserIds } from "@/modules/ee/unify-feedback/lib/contacts";
 import { listFeedbackRecords } from "@/modules/hub/service";
 import type { FeedbackRecordListParams, FeedbackRecordListResponse } from "@/modules/hub/types";
-import { importCsvData } from "./csv-import";
 import { importHistoricalResponses } from "./import";
+import { resolveFormbricksMappingsInput } from "./mappings";
 import {
   TMappingsInput,
   createFeedbackSourceWithMappings,
   deleteFeedbackSource,
   getFeedbackSourceWithMappingsById,
-  updateFeedbackSource,
   updateFeedbackSourceWithMappings,
 } from "./service";
 import {
@@ -78,55 +75,6 @@ export const deleteFeedbackSourceAction = authenticatedActionClient
       return deleteFeedbackSource(parsedInput.feedbackSourceId, parsedInput.workspaceId);
     }
   );
-
-const resolveSurveyMappings = async (
-  surveyId: string,
-  elementIds: string[]
-): Promise<{ surveyId: string; elementId: string; hubFieldType: THubFieldType }[]> => {
-  const survey = await getSurvey(surveyId);
-  if (!survey) {
-    throw new ResourceNotFoundError("Survey", surveyId);
-  }
-
-  const elements = getElementsFromBlocks(survey.blocks);
-  const elementMap = new Map(elements.map((el) => [el.id, el]));
-
-  return elementIds.flatMap((elementId) => {
-    const element = elementMap.get(elementId);
-    if (!element) {
-      logger.warn(
-        { surveyId, elementId },
-        "Skipping unknown elementId when building feedbackSource mappings"
-      );
-      return [];
-    }
-
-    const hubFieldType = getHubFieldTypeFromElementType(element.type);
-    if (!hubFieldType) {
-      logger.warn(
-        { surveyId, elementId, elementType: element.type },
-        "Skipping unmappable element type when building feedbackSource mappings"
-      );
-      return [];
-    }
-
-    return [{ surveyId, elementId, hubFieldType }];
-  });
-};
-
-const resolveFormbricksMappingsInput = async (
-  entries: { surveyId: string; elementIds: string[] }[]
-): Promise<TMappingsInput> => {
-  const allMappings = await Promise.all(
-    entries.map(({ surveyId, elementIds }) => resolveSurveyMappings(surveyId, elementIds))
-  );
-  const flattenedMappings = allMappings.flat();
-  if (flattenedMappings.length === 0) {
-    throw new InvalidInputError("No supported survey questions selected for feedbackSource mapping");
-  }
-
-  return { type: "formbricks_survey", mappings: flattenedMappings };
-};
 
 const ZFormbricksSurveyMapping = z.object({
   surveyId: ZId,
@@ -193,13 +141,25 @@ export const createFeedbackSourceWithMappingsAction = authenticatedActionClient
       ],
     });
 
-    // Verify FRD belongs to same org
+    // Verify the directory belongs to the same org and is actually assigned to this workspace.
+    // The composite FK enforces the assignment at the DB level too; these checks return the
+    // friendlier errors first: a generic auth error for missing/cross-org directories, a typed
+    // error for a same-org directory that just isn't assigned to the workspace.
     const frd = await prisma.feedbackDirectory.findUnique({
       where: { id: parsedInput.feedbackSourceInput.feedbackDirectoryId },
-      select: { organizationId: true },
+      select: {
+        organizationId: true,
+        workspaces: {
+          where: { workspaceId: parsedInput.workspaceId },
+          select: { workspaceId: true },
+        },
+      },
     });
     if (frd?.organizationId !== organizationId) {
       throw new AuthorizationError("Invalid feedback directory");
+    }
+    if (frd.workspaces.length === 0) {
+      throw new InvalidInputError("FEEDBACK_SOURCE_DIRECTORY_NOT_ASSIGNED_TO_WORKSPACE");
     }
 
     let mappingsInput: TMappingsInput | undefined;
@@ -207,16 +167,7 @@ export const createFeedbackSourceWithMappingsAction = authenticatedActionClient
     const { formbricksMappings, fieldMappings } = parsedInput;
 
     if (formbricksMappings?.length) {
-      await Promise.all(
-        formbricksMappings.map(async ({ surveyId }) => {
-          const orgId = await getOrganizationIdFromSurveyId(surveyId);
-          if (orgId !== organizationId) {
-            throw new AuthorizationError("You are not authorized to access this survey");
-          }
-        })
-      );
-
-      mappingsInput = await resolveFormbricksMappingsInput(formbricksMappings);
+      mappingsInput = await resolveFormbricksMappingsInput(formbricksMappings, parsedInput.workspaceId);
     } else if (fieldMappings?.length) {
       mappingsInput = {
         type: "field",
@@ -269,28 +220,27 @@ export const updateFeedbackSourceWithMappingsAction = authenticatedActionClient
         ],
       });
 
+      // The check above proves the caller may act in `workspaceId`; it does not prove this feedback
+      // source lives there, and the organization it was authorized against came from the source
+      // rather than the workspace. Pin the two together up front so every branch below — and the
+      // mappings resolved against the same workspace — operates on one tenant, and so a mismatch
+      // fails here rather than as a Prisma error from the update.
+      const feedbackSource = await prisma.feedbackSource.findUnique({
+        where: { id: parsedInput.feedbackSourceId, workspaceId: parsedInput.workspaceId },
+        select: { type: true },
+      });
+      if (!feedbackSource) {
+        throw new ResourceNotFoundError("FeedbackSource", parsedInput.feedbackSourceId);
+      }
+
       let mappingsInput: TMappingsInput | undefined;
 
       if (parsedInput.formbricksMappings?.length) {
-        await Promise.all(
-          parsedInput.formbricksMappings.map(async ({ surveyId }) => {
-            const orgId = await getOrganizationIdFromSurveyId(surveyId);
-            if (orgId !== organizationId) {
-              throw new AuthorizationError("You are not authorized to access this survey");
-            }
-          })
+        mappingsInput = await resolveFormbricksMappingsInput(
+          parsedInput.formbricksMappings,
+          parsedInput.workspaceId
         );
-
-        mappingsInput = await resolveFormbricksMappingsInput(parsedInput.formbricksMappings);
       } else if (parsedInput.fieldMappings && parsedInput.fieldMappings.length > 0) {
-        const feedbackSource = await prisma.feedbackSource.findUnique({
-          where: { id: parsedInput.feedbackSourceId, workspaceId: parsedInput.workspaceId },
-          select: { type: true },
-        });
-        if (!feedbackSource) {
-          throw new ResourceNotFoundError("FeedbackSource", parsedInput.feedbackSourceId);
-        }
-
         mappingsInput = {
           type: "field",
           mappings:
@@ -304,83 +254,6 @@ export const updateFeedbackSourceWithMappingsAction = authenticatedActionClient
         parsedInput.feedbackSourceId,
         parsedInput.workspaceId,
         parsedInput.feedbackSourceInput,
-        mappingsInput
-      );
-    }
-  );
-
-const ZDuplicateFeedbackSourceAction = z.object({
-  feedbackSourceId: ZId,
-  workspaceId: ZId,
-});
-
-export const duplicateFeedbackSourceAction = authenticatedActionClient
-  .inputSchema(ZDuplicateFeedbackSourceAction)
-  .action(
-    async ({
-      ctx,
-      parsedInput,
-    }: {
-      ctx: AuthenticatedActionClientCtx;
-      parsedInput: z.infer<typeof ZDuplicateFeedbackSourceAction>;
-    }): Promise<TFeedbackSourceWithMappings> => {
-      const organizationId = await getOrganizationIdFromFeedbackSourceId(parsedInput.feedbackSourceId);
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager"],
-          },
-          {
-            type: "workspaceTeam",
-            minPermission: "readWrite",
-            workspaceId: parsedInput.workspaceId,
-          },
-        ],
-      });
-
-      const source = await getFeedbackSourceWithMappingsById(
-        parsedInput.feedbackSourceId,
-        parsedInput.workspaceId
-      );
-      if (!source) {
-        throw new ResourceNotFoundError("FeedbackSource", parsedInput.feedbackSourceId);
-      }
-
-      let mappingsInput: TMappingsInput | undefined;
-
-      if (source.type === "formbricks_survey" && source.formbricksMappings.length > 0) {
-        mappingsInput = {
-          type: "formbricks_survey",
-          mappings: source.formbricksMappings.map((m) => ({
-            surveyId: m.surveyId,
-            elementId: m.elementId,
-            hubFieldType: m.hubFieldType,
-            customFieldLabel: m.customFieldLabel ?? undefined,
-          })),
-        };
-      } else if (source.fieldMappings.length > 0) {
-        const projected = source.fieldMappings.map((m) => ({
-          sourceFieldId: m.sourceFieldId,
-          targetFieldId: m.targetFieldId,
-          staticValue: m.staticValue ?? undefined,
-        }));
-        mappingsInput = {
-          type: "field",
-          mappings: source.type === "csv" ? sanitizeAndValidateCsvFieldMappings(projected) : projected,
-        };
-      }
-
-      return createFeedbackSourceWithMappings(
-        parsedInput.workspaceId,
-        {
-          name: `${source.name} (copy)`,
-          type: source.type,
-          feedbackDirectoryId: source.feedbackDirectoryId,
-          createdBy: ctx.user.id,
-        },
         mappingsInput
       );
     }
@@ -468,60 +341,17 @@ export const importHistoricalResponsesAction = authenticatedActionClient
         throw new ResourceNotFoundError("Survey", parsedInput.surveyId);
       }
 
+      // The authorization above covers the feedback source's workspace, not this survey — and the
+      // import reads every response of `surveyId` and copies them into the source's feedback
+      // directory. Without this check any caller with readWrite on one workspace could name a survey
+      // from another organization and exfiltrate its responses into their own directory. Survey ids
+      // are public (they appear in `/s/<surveyId>` links), so the id is not a secret. The picker only
+      // ever offers surveys from this workspace (`getSurveysForUnifyAction` → `getSurveys(workspaceId)`).
+      if (survey.workspaceId !== parsedInput.workspaceId) {
+        throw new ResourceNotFoundError("Survey", parsedInput.surveyId);
+      }
+
       return importHistoricalResponses(feedbackSource, survey);
-    }
-  );
-
-const ZImportCsvDataAction = z.object({
-  feedbackSourceId: ZId,
-  workspaceId: ZId,
-  csvData: z.array(z.record(z.string(), z.string())).min(1),
-});
-
-export const importCsvDataAction = authenticatedActionClient
-  .inputSchema(ZImportCsvDataAction)
-  .action(
-    async ({
-      ctx,
-      parsedInput,
-    }: {
-      ctx: AuthenticatedActionClientCtx;
-      parsedInput: z.infer<typeof ZImportCsvDataAction>;
-    }) => {
-      const organizationId = await getOrganizationIdFromFeedbackSourceId(parsedInput.feedbackSourceId);
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager"],
-          },
-          {
-            type: "workspaceTeam",
-            minPermission: "readWrite",
-            workspaceId: parsedInput.workspaceId,
-          },
-        ],
-      });
-
-      const feedbackSource = await getFeedbackSourceWithMappingsById(
-        parsedInput.feedbackSourceId,
-        parsedInput.workspaceId
-      );
-      if (!feedbackSource) {
-        throw new ResourceNotFoundError("FeedbackSource", parsedInput.feedbackSourceId);
-      }
-
-      const result = await importCsvData(feedbackSource, parsedInput.csvData);
-
-      if (result.successes > 0) {
-        await updateFeedbackSource(parsedInput.feedbackSourceId, parsedInput.workspaceId, {
-          lastSyncAt: new Date(),
-        });
-      }
-
-      return result;
     }
   );
 
@@ -588,5 +418,42 @@ export const listFeedbackRecordsAction = authenticatedActionClient
       }
 
       return result.data;
+    }
+  );
+
+const ZGetFeedbackRecordContactsAction = z.object({
+  workspaceId: ZId,
+  userIds: z.array(z.string()).max(1000),
+});
+
+// Resolves a page of feedback records' user_ids to Formbricks contact ids (batched, deduped).
+export const getFeedbackRecordContactsAction = authenticatedActionClient
+  .inputSchema(ZGetFeedbackRecordContactsAction)
+  .action(
+    async ({
+      ctx,
+      parsedInput,
+    }: {
+      ctx: AuthenticatedActionClientCtx;
+      parsedInput: z.infer<typeof ZGetFeedbackRecordContactsAction>;
+    }): Promise<Record<string, string>> => {
+      const organizationId = await getOrganizationIdFromWorkspaceId(parsedInput.workspaceId);
+      await checkAuthorizationUpdated({
+        userId: ctx.user.id,
+        organizationId,
+        access: [
+          {
+            type: "organization",
+            roles: ["owner", "manager"],
+          },
+          {
+            type: "workspaceTeam",
+            minPermission: "read",
+            workspaceId: parsedInput.workspaceId,
+          },
+        ],
+      });
+
+      return getContactIdsByUserIds(parsedInput.workspaceId, parsedInput.userIds);
     }
   );

@@ -18,6 +18,7 @@ const apiKeySelect = {
       workspace: {
         select: {
           id: true,
+          organizationId: true,
           legacyEnvironmentId: true,
           createdAt: true,
           updatedAt: true,
@@ -40,6 +41,7 @@ type ApiKeyData = {
     permission: string;
     workspace: {
       id: string;
+      organizationId: string;
       legacyEnvironmentId: string | null;
       createdAt: Date;
       updatedAt: Date;
@@ -52,11 +54,20 @@ type ApiKeyData = {
 const validateApiKey = async (apiKey: string): Promise<ApiKeyData | null> => {
   const v2Parsed = parseApiKeyV2(apiKey);
 
-  if (v2Parsed) {
-    return validateV2ApiKey(v2Parsed);
+  const apiKeyData = v2Parsed ? await validateV2ApiKey(v2Parsed) : await validateLegacyApiKey(apiKey);
+  if (!apiKeyData) {
+    return null;
   }
 
-  return validateLegacyApiKey(apiKey);
+  // ENG-1749: drop workspace permissions outside the key's organization (defense-in-depth,
+  // mirroring authenticateApiKeyFromHeaders) so a pre-fix cross-org row can't leak workspace
+  // metadata through this legacy route.
+  return {
+    ...apiKeyData,
+    apiKeyWorkspaces: apiKeyData.apiKeyWorkspaces.filter(
+      (workspacePermission) => workspacePermission.workspace.organizationId === apiKeyData.organizationId
+    ),
+  };
 };
 
 const validateV2ApiKey = async (v2Parsed: { secret: string }): Promise<ApiKeyData | null> => {
@@ -152,7 +163,12 @@ const handleApiKeyAuthentication = async (apiKey: string) => {
 
   // Rate limiting for apiKey auth is enforced by Envoy in v5 — see envoy-rate-limit-coverage.ts
   if (!isValidApiKeyEnvironment(apiKeyData)) {
-    return responses.badRequestResponse("You can't use this method with this API key");
+    // This legacy endpoint returns a single workspace's (environment's) details, so it only works
+    // for keys scoped to exactly one workspace. Organization-only keys (no workspace) and keys with
+    // multiple workspaces land here — point them at the v2 endpoint that returns full permissions.
+    return responses.badRequestResponse(
+      "This endpoint only supports API keys that are scoped to a single workspace. Use GET /api/v2/me to inspect organization-level API keys or keys with access to multiple workspaces."
+    );
   }
 
   return buildWorkspaceResponse(apiKeyData);

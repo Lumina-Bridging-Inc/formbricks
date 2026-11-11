@@ -7,11 +7,12 @@ import type {
   TSurveyElementChoice,
   TSurveyMatrixElement,
   TSurveyMatrixElementChoice,
+  TSurveyMultipleChoiceElement,
   TSurveyRankingElement,
 } from "@formbricks/types/surveys/elements";
 import type { TSurvey } from "@formbricks/types/surveys/types";
 import { getTextContent } from "@formbricks/types/surveys/validation";
-import { getLocalizedValue } from "@/lib/i18n/utils";
+import { getLanguageCode, getLocalizedValue } from "@/lib/i18n/utils";
 import { getElementsFromBlocks } from "@/lib/survey/utils";
 import type { FeedbackRecordCreateParams } from "@/modules/hub";
 
@@ -31,6 +32,44 @@ const findChoiceByLabel = <T extends { id: string; label: TSurveyElementChoice["
   language: string
 ): T | undefined => {
   return choices.find((choice) => getChoiceLabel(choice, language) === label);
+};
+
+interface NormalizedChoiceValue {
+  value: TResponseDataValue;
+  /**
+   * Stable id of the matched choice (ENG-1673), set when the submitted value matched a known
+   * choice. Unmatched values ("other" free text, edited labels) have none. Multi-select answers
+   * are split into one record per option upstream (expandMultiChoiceToRecords), so each selected
+   * option keeps its own id.
+   */
+  valueId?: string;
+}
+
+/**
+ * Normalize a single choice answer for storage.
+ *
+ * - value_text = the choice's DEFAULT-language label (canonical) for a selection that matched a
+ *   known choice, so the same option reads and groups consistently regardless of the response
+ *   language. Unmatched values ("other" free text, edited labels) are stored as submitted.
+ * - value_id   = stable cross-language grouping id consumed by charts, set to the matched choice id.
+ *
+ * Multi-select answers are split into one record per option before they reach here
+ * (expandMultiChoiceToRecords), so this helper only ever sees a single value.
+ */
+const normalizeChoiceValue = (
+  choices: { id: string; label: TSurveyElementChoice["label"] }[] | undefined,
+  value: TResponseDataValue,
+  language: string
+): NormalizedChoiceValue => {
+  if (!choices?.length) return { value };
+
+  if (typeof value === "string") {
+    const choice = findChoiceByLabel(choices, value, language);
+    // Canonicalize to the default-language label; value_id is the stable grouping key.
+    return choice ? { value: getChoiceLabel(choice, "default"), valueId: choice.id } : { value };
+  }
+
+  return { value };
 };
 
 const toIsoTimestamp = (value: unknown): string | null => {
@@ -140,21 +179,28 @@ const expandMatrixToRecords = (
   element: TSurveyMatrixElement,
   mapping: TFeedbackSourceFormbricksMapping,
   value: TResponseDataValue,
-  baseFields: BaseRecordFields
+  baseFields: BaseRecordFields,
+  lookupLanguage: string
 ): FeedbackRecordCreateParams[] => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return [];
 
-  const language = baseFields.language ?? "default";
   const groupLabel = mapping.customFieldLabel || getHeadlineFromElement(element);
   const records: FeedbackRecordCreateParams[] = [];
 
   for (const [rowLabel, columnLabel] of Object.entries(value)) {
     if (columnLabel === undefined || columnLabel === null || columnLabel === "") continue;
 
-    const row = findChoiceByLabel<TSurveyMatrixElementChoice>(element.rows, rowLabel, language);
+    const row = findChoiceByLabel<TSurveyMatrixElementChoice>(element.rows, rowLabel, lookupLanguage);
     if (!row) continue;
 
-    const valueFields = convertValueToHubFields(columnLabel as TResponseDataValue, mapping.hubFieldType);
+    // Column labels are localized like the row labels — store the label as submitted and
+    // attach the column id as stable cross-language identity (ENG-1673).
+    const matchedColumn = normalizeChoiceValue(
+      element.columns,
+      columnLabel as TResponseDataValue,
+      lookupLanguage
+    );
+    const valueFields = convertValueToHubFields(matchedColumn.value, mapping.hubFieldType);
 
     records.push({
       ...baseFields,
@@ -165,6 +211,7 @@ const expandMatrixToRecords = (
       field_group_label: groupLabel,
       metadata: { question_type: "matrix" },
       ...valueFields,
+      ...(matchedColumn.valueId ? { value_id: matchedColumn.valueId } : {}),
     });
   }
 
@@ -175,18 +222,18 @@ const expandRankingToRecords = (
   element: TSurveyRankingElement,
   mapping: TFeedbackSourceFormbricksMapping,
   value: TResponseDataValue,
-  baseFields: BaseRecordFields
+  baseFields: BaseRecordFields,
+  lookupLanguage: string
 ): FeedbackRecordCreateParams[] => {
   if (!Array.isArray(value) || value.length === 0) return [];
 
-  const language = baseFields.language ?? "default";
   const groupLabel = mapping.customFieldLabel || getHeadlineFromElement(element);
   const records: FeedbackRecordCreateParams[] = [];
 
   value.forEach((itemLabel, index) => {
     if (typeof itemLabel !== "string" || itemLabel === "") return;
 
-    const choice = findChoiceByLabel<TSurveyElementChoice>(element.choices, itemLabel, language);
+    const choice = findChoiceByLabel<TSurveyElementChoice>(element.choices, itemLabel, lookupLanguage);
     if (!choice) return;
 
     records.push({
@@ -205,15 +252,101 @@ const expandRankingToRecords = (
 };
 
 /**
+ * Split a multi-select answer into one record per selected option (ENG-1702, building on the
+ * ENG-1673 stable-identity work). A single value_id column cannot hold multiple option ids, so —
+ * like matrix and ranking — the answer expands into one record per selection, each carrying its
+ * own value_id. Every record shares field_group_id (the element id) so analytics can aggregate
+ * across the set, and inherits submission_id via baseFields to stay tied to the respondent.
+ *
+ * value_text = the choice's DEFAULT-language label (canonical) for matched selections; unmatched
+ * entries ("other" free text, edited labels) keep the submitted text. When the element offers an
+ * "other" option, unmatched entries group under the stable "other" id (survey convention: the
+ * other option's choice id is "other"). Empty selections produce no records.
+ */
+const expandMultiChoiceToRecords = (
+  element: TSurveyMultipleChoiceElement,
+  mapping: TFeedbackSourceFormbricksMapping,
+  value: TResponseDataValue,
+  baseFields: BaseRecordFields,
+  lookupLanguage: string
+): FeedbackRecordCreateParams[] => {
+  if (!Array.isArray(value) || value.length === 0) return [];
+
+  const fieldLabel = mapping.customFieldLabel || getHeadlineFromElement(element);
+  const choices = element.choices ?? [];
+  const hasOtherOption =
+    element.otherOptionPlaceholder !== undefined || choices.some((choice) => choice.id === "other");
+  const records: FeedbackRecordCreateParams[] = [];
+
+  value.forEach((entry) => {
+    if (typeof entry !== "string" || entry === "") return;
+
+    const choice = findChoiceByLabel(choices, entry, lookupLanguage);
+    // Matched choice → canonical default-language label + stable id. Unmatched entry → the "other"
+    // free text; group it under the stable "other" id when the element offers that option.
+    const valueId = choice?.id ?? (hasOtherOption ? "other" : undefined);
+    const canonicalValue = choice ? getChoiceLabel(choice, "default") : entry;
+    const valueFields = convertValueToHubFields(canonicalValue, mapping.hubFieldType);
+
+    records.push({
+      ...baseFields,
+      field_id: `${element.id}__${valueId ?? entry}`,
+      field_type: mapping.hubFieldType,
+      field_label: fieldLabel,
+      field_group_id: element.id,
+      field_group_label: fieldLabel,
+      metadata: { question_type: "multipleChoiceMulti" },
+      ...valueFields,
+      ...(valueId ? { value_id: valueId } : {}),
+    });
+  });
+
+  return records;
+};
+
+/**
+ * Normalize an element's answer for storage. Choice elements canonicalize labels and resolve
+ * value_id via normalizeChoiceValue; every other element type stores the value as submitted.
+ *
+ * "Other" free-text answers never match a choice label, so they'd otherwise carry no
+ * value_id and each distinct free-text string would chart as its own bucket. When the
+ * element offers an "other" option, group them all under the stable "other" choice id
+ * (the survey convention: the other option's choice id is "other").
+ */
+const normalizeElementValue = (
+  element: TSurveyElement | undefined,
+  value: TResponseDataValue,
+  lookupLanguage: string
+): NormalizedChoiceValue => {
+  const isChoiceElement =
+    element &&
+    (element.type === TSurveyElementTypeEnum.MultipleChoiceSingle ||
+      element.type === TSurveyElementTypeEnum.MultipleChoiceMulti);
+  if (!isChoiceElement) return { value };
+
+  const normalized = normalizeChoiceValue(element.choices, value, lookupLanguage);
+
+  if (
+    !normalized.valueId &&
+    typeof value === "string" &&
+    (element.otherOptionPlaceholder !== undefined || element.choices.some((c) => c.id === "other"))
+  ) {
+    normalized.valueId = "other";
+  }
+
+  return normalized;
+};
+
+/**
  * Transform a Formbricks survey response into FeedbackRecord payloads.
  * Called from the pipeline handler when a response is created/finished.
  *
- * Matrix and ranking questions expand into one record per row/item, sharing a
- * field_group_id so Hub analytics can aggregate across them.
+ * Matrix, ranking, and multi-select questions expand into one record per row/item/option,
+ * sharing a field_group_id so Hub analytics can aggregate across them.
  */
 export function transformResponseToFeedbackRecords(
   response: TResponse,
-  survey: Pick<TSurvey, "id" | "name" | "blocks">,
+  survey: Pick<TSurvey, "id" | "name" | "blocks" | "languages">,
   mappings: TFeedbackSourceFormbricksMapping[],
   tenantId: string
 ): FeedbackRecordCreateParams[] {
@@ -224,6 +357,10 @@ export function transformResponseToFeedbackRecords(
   const elements = getElementsFromBlocks(survey.blocks);
   const elementMap = new Map(elements.map((el) => [el.id, el]));
   const baseFields = buildBaseFields(response, survey, tenantId);
+  // Responses in the survey's default language may carry its concrete code (e.g. "en-US")
+  // while choice labels store that language under the "default" key — resolve the code to
+  // the label key so choice matching for value_id (ENG-1673) works.
+  const lookupLanguage = getLanguageCode(survey.languages ?? [], response.language ?? null);
   const feedbackRecords: FeedbackRecordCreateParams[] = [];
 
   for (const mapping of surveyMappings) {
@@ -233,17 +370,28 @@ export function transformResponseToFeedbackRecords(
     const element = elementMap.get(mapping.elementId);
 
     if (element?.type === TSurveyElementTypeEnum.Matrix) {
-      feedbackRecords.push(...expandMatrixToRecords(element, mapping, value, baseFields));
+      feedbackRecords.push(...expandMatrixToRecords(element, mapping, value, baseFields, lookupLanguage));
       continue;
     }
 
     if (element?.type === TSurveyElementTypeEnum.Ranking) {
-      feedbackRecords.push(...expandRankingToRecords(element, mapping, value, baseFields));
+      feedbackRecords.push(...expandRankingToRecords(element, mapping, value, baseFields, lookupLanguage));
+      continue;
+    }
+
+    // Multi-select splits into one record per selected option so each keeps its own stable
+    // value_id (ENG-1702). A single string answer falls through to the generic path below.
+    if (element?.type === TSurveyElementTypeEnum.MultipleChoiceMulti && Array.isArray(value)) {
+      feedbackRecords.push(
+        ...expandMultiChoiceToRecords(element, mapping, value, baseFields, lookupLanguage)
+      );
       continue;
     }
 
     const fieldLabel = mapping.customFieldLabel || getHeadlineFromElement(element);
-    const valueFields = convertValueToHubFields(value, mapping.hubFieldType);
+
+    const normalized = normalizeElementValue(element, value, lookupLanguage);
+    const valueFields = convertValueToHubFields(normalized.value, mapping.hubFieldType);
 
     feedbackRecords.push({
       ...baseFields,
@@ -251,6 +399,7 @@ export function transformResponseToFeedbackRecords(
       field_type: mapping.hubFieldType,
       field_label: fieldLabel,
       ...valueFields,
+      ...(normalized.valueId ? { value_id: normalized.valueId } : {}),
     });
   }
 

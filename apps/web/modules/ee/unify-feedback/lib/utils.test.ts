@@ -1,18 +1,17 @@
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test } from "vitest";
 import type { FeedbackRecordData } from "@/modules/hub/types";
 import {
+  formatFieldType,
   formatSourceType,
-  getCreateDefaults,
   getReadOnlyMetadataEntries,
   getValueFieldByType,
   isPresetSourceType,
   mapRecordToValues,
   parseNumberValue,
+  resolveFeedbackDisplayText,
   toISOOrUndefined,
   toLocalDateTimeInput,
 } from "./utils";
-
-vi.mock("uuid", () => ({ v7: () => "mock-uuid-v7" }));
 
 const makeRecord = (overrides: Partial<FeedbackRecordData> = {}): FeedbackRecordData => ({
   id: "rec-1",
@@ -69,22 +68,6 @@ describe("toISOOrUndefined", () => {
 
   test("returns undefined for invalid date", () => {
     expect(toISOOrUndefined("not-a-date")).toBeUndefined();
-  });
-});
-
-describe("getCreateDefaults", () => {
-  test("uses first directory as tenant_id", () => {
-    const dirs = [{ id: "dir-1", name: "Dir 1" }];
-    const result = getCreateDefaults(dirs);
-    expect(result.tenant_id).toBe("dir-1");
-    expect(result.submission_id).toBe("mock-uuid-v7");
-    expect(result.field_type).toBe("text");
-    expect(result.metadataEntries).toEqual([]);
-  });
-
-  test("handles empty directories", () => {
-    const result = getCreateDefaults([]);
-    expect(result.tenant_id).toBe("");
   });
 });
 
@@ -165,5 +148,94 @@ describe("formatSourceType", () => {
 
   test("returns raw value for unknown types", () => {
     expect(formatSourceType("custom", t)).toBe("custom");
+  });
+});
+
+describe("formatFieldType", () => {
+  test("capitalizes non-acronym types", () => {
+    expect(formatFieldType("text")).toBe("Text");
+    expect(formatFieldType("categorical")).toBe("Categorical");
+    expect(formatFieldType("number")).toBe("Number");
+    expect(formatFieldType("date")).toBe("Date");
+  });
+
+  test("upper-cases acronym types", () => {
+    expect(formatFieldType("nps")).toBe("NPS");
+    expect(formatFieldType("csat")).toBe("CSAT");
+    expect(formatFieldType("ces")).toBe("CES");
+  });
+
+  test("returns empty string unchanged", () => {
+    expect(formatFieldType("")).toBe("");
+  });
+});
+
+describe("resolveFeedbackDisplayText", () => {
+  test("prefers the translation when present and different from the original", () => {
+    const result = resolveFeedbackDisplayText(
+      makeRecord({
+        value_text: "Großartig",
+        value_text_translated: "Great",
+        translation_lang_key: "en",
+      })
+    );
+    expect(result).toEqual({
+      text: "Great",
+      original: "Großartig",
+      isTranslated: true,
+      langKey: "en",
+    });
+  });
+
+  test("falls back to the original when no translation exists", () => {
+    const result = resolveFeedbackDisplayText(makeRecord({ value_text: "Hello" }));
+    expect(result).toEqual({
+      text: "Hello",
+      original: "Hello",
+      isTranslated: false,
+      langKey: null,
+    });
+  });
+
+  test.each([["   "], [""]])(
+    "ignores empty/whitespace-only translations (%j) and shows the original",
+    (translated) => {
+      const result = resolveFeedbackDisplayText(
+        makeRecord({ value_text: "Original", value_text_translated: translated, translation_lang_key: "en" })
+      );
+      expect(result.text).toBe("Original");
+      expect(result.isTranslated).toBe(false);
+      expect(result.langKey).toBeNull();
+    }
+  );
+
+  test("does not flag a translation identical to the original", () => {
+    const result = resolveFeedbackDisplayText(
+      makeRecord({ value_text: "Same", value_text_translated: "Same", translation_lang_key: "en" })
+    );
+    expect(result.text).toBe("Same");
+    expect(result.isTranslated).toBe(false);
+    expect(result.langKey).toBeNull();
+  });
+
+  test("drops the language key when there is no usable translation", () => {
+    const result = resolveFeedbackDisplayText(
+      makeRecord({ value_text: "Hello", translation_lang_key: "en" })
+    );
+    expect(result.isTranslated).toBe(false);
+    expect(result.langKey).toBeNull();
+  });
+
+  test("returns null text when the record carries no text value at all", () => {
+    const result = resolveFeedbackDisplayText(makeRecord({ value_text: undefined }));
+    expect(result.text).toBeNull();
+    expect(result.original).toBeNull();
+    expect(result.isTranslated).toBe(false);
+  });
+
+  test("preserves an empty-string original (does not collapse to null)", () => {
+    const result = resolveFeedbackDisplayText(makeRecord({ value_text: "" }));
+    expect(result.text).toBe("");
+    expect(result.original).toBe("");
   });
 });

@@ -1,9 +1,10 @@
 "use server";
 
 import { z } from "zod";
-import { ZChartQuery } from "@formbricks/types/analysis";
+import { type TChartQuery, ZChartQuery } from "@formbricks/types/analysis";
 import { ZId } from "@formbricks/types/common";
 import { OperationNotAllowedError } from "@formbricks/types/errors";
+import { capturePostHogEvent } from "@/lib/posthog";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
 import { AuthenticatedActionClientCtx } from "@/lib/utils/action-client/types/context";
 import { executeTenantScopedQuery } from "@/modules/ee/analysis/api/lib/cube-client";
@@ -16,7 +17,9 @@ import {
   getCharts,
   updateChart,
 } from "@/modules/ee/analysis/charts/lib/charts";
+import { resolveOptionGrouping } from "@/modules/ee/analysis/charts/lib/option-grouping";
 import { checkFeedbackDirectoryAccess, checkWorkspaceAccess } from "@/modules/ee/analysis/lib/access";
+import { isSelectableValueDimension } from "@/modules/ee/analysis/lib/schema-definition";
 import { ZChartCreateInput, ZChartUpdateInput } from "@/modules/ee/analysis/types/analysis";
 import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
 import { getIsDashboardsEnabled } from "@/modules/ee/license-check/lib/utils";
@@ -72,6 +75,12 @@ export const createChartAction = authenticatedActionClient.inputSchema(ZCreateCh
       ctx.auditLoggingCtx.workspaceId = workspaceId;
       ctx.auditLoggingCtx.chartId = chart.id;
       ctx.auditLoggingCtx.newObject = chart;
+      capturePostHogEvent(
+        ctx.user.id,
+        "chart_created",
+        { chart_id: chart.id },
+        { organizationId, workspaceId }
+      );
       return chart;
     }
   )
@@ -270,14 +279,20 @@ export const executeQueryAction = authenticatedActionClient
         source: "charts.executeQueryAction",
       });
 
-      return executeTenantScopedQuery({
-        query: parsedInput.query,
+      const { rewrittenQuery, optionLabels } = await resolveOptionGrouping(parsedInput.query, workspaceId);
+
+      const rawRows = await executeTenantScopedQuery({
+        query: rewrittenQuery,
         feedbackDirectoryId,
         workspaceId,
         organizationId,
         userId: ctx.user.id,
         source: "charts.executeQueryAction",
       });
+
+      const rows = Array.isArray(rawRows) ? rawRows : [];
+
+      return { rows, ...(optionLabels ? { optionLabels } : {}), effectiveQuery: rewrittenQuery };
     }
   );
 
@@ -313,7 +328,7 @@ export const generateAIChartAction = authenticatedActionClient
         source: "charts.generateAIChartAction",
       });
 
-      const { chartType, query } = await generateAIChartQuery({
+      const { chartType, query, name } = await generateAIChartQuery({
         organizationId,
         prompt: parsedInput.prompt,
       });
@@ -333,6 +348,86 @@ export const generateAIChartAction = authenticatedActionClient
         query: validatedQuery,
         chartType,
         data: Array.isArray(data) ? data : [],
+        // Prefills the chart-name input (only when the user hasn't typed a name).
+        suggestedName: name,
       };
+    }
+  );
+
+// Max distinct values returned for a filter value pick-list. Bounded so high-cardinality
+// dimensions stay responsive; the `search` term narrows results server-side beyond this cap.
+const DIMENSION_VALUE_LOOKUP_LIMIT = 100;
+
+const ZGetDimensionValuesAction = z.object({
+  workspaceId: ZId,
+  feedbackDirectoryId: ZId,
+  dimension: z.string().refine(isSelectableValueDimension, {
+    message: "Unsupported dimension for value lookup",
+  }),
+  search: z.string().trim().max(255).optional(),
+});
+
+/**
+ * Returns the distinct stored values for a low-cardinality string dimension, so the
+ * filter UI can offer a pick-list instead of free-text entry. Picking a real value
+ * guarantees an exact match for the `equals` / `notEquals` operators. Search narrows
+ * results server-side so dimensions with more than the lookup cap stay usable.
+ */
+export const getDimensionValuesAction = authenticatedActionClient
+  .inputSchema(ZGetDimensionValuesAction)
+  .action(
+    async ({
+      ctx,
+      parsedInput,
+    }: {
+      ctx: AuthenticatedActionClientCtx;
+      parsedInput: z.infer<typeof ZGetDimensionValuesAction>;
+    }): Promise<string[]> => {
+      const { organizationId, workspaceId } = await checkWorkspaceAccess(
+        ctx.user.id,
+        parsedInput.workspaceId,
+        "read"
+      );
+
+      await checkDashboardsEnabled(organizationId);
+
+      const { feedbackDirectoryId } = await checkFeedbackDirectoryAccess({
+        feedbackDirectoryId: parsedInput.feedbackDirectoryId,
+        organizationId,
+        workspaceId,
+        userId: ctx.user.id,
+        source: "charts.getDimensionValuesAction",
+      });
+
+      const { dimension, search } = parsedInput;
+
+      const query: TChartQuery = {
+        dimensions: [dimension],
+        order: [[dimension, "asc"]],
+        limit: DIMENSION_VALUE_LOOKUP_LIMIT,
+        ...(search ? { filters: [{ member: dimension, operator: "contains", values: [search] }] } : {}),
+      };
+
+      const rows = await executeTenantScopedQuery({
+        query,
+        feedbackDirectoryId,
+        workspaceId,
+        organizationId,
+        userId: ctx.user.id,
+        source: "charts.getDimensionValuesAction",
+      });
+
+      const seen = new Set<string>();
+      const values: string[] = [];
+      for (const row of Array.isArray(rows) ? rows : []) {
+        const raw = (row as Record<string, unknown>)[dimension];
+        if (typeof raw !== "string") continue;
+        const value = raw.trim();
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        values.push(value);
+      }
+
+      return values;
     }
   );

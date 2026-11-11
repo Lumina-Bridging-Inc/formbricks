@@ -26,8 +26,6 @@ export const TERMS_URL = env.TERMS_URL;
 export const IMPRINT_URL = env.IMPRINT_URL;
 export const IMPRINT_ADDRESS = env.IMPRINT_ADDRESS;
 
-export const DISABLE_ACCOUNT_DELETION_SSO_CONFIRMATION =
-  env.DISABLE_ACCOUNT_DELETION_SSO_CONFIRMATION === "1";
 export const DANGEROUSLY_ALLOW_WEBHOOK_INTERNAL_URLS = env.DANGEROUSLY_ALLOW_WEBHOOK_INTERNAL_URLS === "1";
 export const DEBUG_SHOW_RESET_LINK = !IS_PRODUCTION && env.DEBUG_SHOW_RESET_LINK === "1";
 export const PASSWORD_RESET_DISABLED = env.PASSWORD_RESET_DISABLED === "1";
@@ -105,6 +103,10 @@ export const MAX_OTHER_OPTION_LENGTH = 250;
 
 export const SKIP_INVITE_FOR_SSO = env.AUTH_SKIP_INVITE_FOR_SSO === "1";
 export const DEFAULT_TEAM_ID = env.AUTH_DEFAULT_TEAM_ID;
+
+// Cloud-only kill-switch: when enabled, the personal-email sign-up block also applies to invited
+// users (default exempts invites). See @/modules/auth/lib/signup-email-domain.
+export const SIGNUP_DOMAIN_CHECK_ON_INVITES = env.SIGNUP_DOMAIN_CHECK_ON_INVITES === "1";
 
 export const SLACK_MESSAGE_LIMIT = 2995;
 export const GOOGLE_SHEET_MESSAGE_LIMIT = 49995;
@@ -198,6 +200,12 @@ export const AVAILABLE_LOCALES: TUserLocale[] = [
 export const CHATWOOT_WEBSITE_TOKEN = env.CHATWOOT_WEBSITE_TOKEN;
 export const CHATWOOT_BASE_URL = env.CHATWOOT_BASE_URL || "https://app.chatwoot.com";
 export const IS_CHATWOOT_CONFIGURED = Boolean(env.CHATWOOT_WEBSITE_TOKEN);
+
+// Formbricks-in-Formbricks: in-app surveys served by a Formbricks instance
+// (defaults to Formbricks Cloud). The widget only mounts when a workspace id is set.
+export const FORMBRICKS_WORKSPACE_ID = env.FORMBRICKS_WORKSPACE_ID;
+export const FORMBRICKS_APP_URL = env.FORMBRICKS_APP_URL || "https://app.formbricks.com";
+export const IS_FORMBRICKS_SURVEYS_CONFIGURED = Boolean(env.FORMBRICKS_WORKSPACE_ID);
 
 export const POSTHOG_KEY = env.POSTHOG_KEY;
 

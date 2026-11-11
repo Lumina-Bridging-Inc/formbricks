@@ -9,11 +9,13 @@ import {
   type TCloudBillingInterval,
   type TCloudBillingPlan,
   type TOrganizationBilling,
+  type TOrganizationStripeBilling,
   type TOrganizationStripePendingChange,
   type TOrganizationStripeSubscriptionStatus,
 } from "@formbricks/types/organizations";
 import { cache } from "@/lib/cache";
 import { IS_FORMBRICKS_CLOUD, WEBAPP_URL } from "@/lib/constants";
+import { capturePostHogEvent } from "@/lib/posthog";
 import {
   type TStandardCloudPlan,
   getCatalogItemForPlan,
@@ -71,6 +73,9 @@ const mapBillingRecord = (billing: TOrganizationBillingRecord | null): TOrganiza
 
 const toIsoStringOrNull = (date: Date | null | undefined): string | null =>
   date ? date.toISOString() : null;
+
+const isPaidCloudPlan = (plan: TCloudBillingPlan | null | undefined): boolean =>
+  plan === "pro" || plan === "scale";
 
 const getDateFromBilling = (value: string | null | undefined): Date | null => {
   if (!value) return null;
@@ -585,7 +590,10 @@ export const createPaidPlanCheckoutSession = async (input: {
       address: "auto",
       name: "auto",
     },
-    success_url: `${WEBAPP_URL}/billing-confirmation?organizationId=${input.organizationId}&checkout_success=1`,
+    // Carry the purchased plan so the confirmation page can force a Stripe sync (the read-through
+    // sync only refreshes a >5min-stale snapshot, so a fresh post-checkout snapshot would otherwise
+    // keep serving the old plan) before returning to billing.
+    success_url: `${WEBAPP_URL}/billing-confirmation?organizationId=${input.organizationId}&checkout_success=1&plan=${input.plan}`,
     cancel_url: `${WEBAPP_URL}/organizations/${input.organizationId}/settings/billing`,
     metadata: {
       organizationId: input.organizationId,
@@ -645,14 +653,20 @@ const clearPendingPlanState = async (
   await updatePendingPlanChangeSnapshot(organizationId, null);
 };
 
+// When the prorated upgrade invoice needs 3D Secure, `clientSecret` carries the invoice
+// PaymentIntent secret for on-session confirmation; otherwise both are null/false.
+export type TUpgradePaymentConfirmation = {
+  clientSecret: string | null;
+  requiresAction: boolean;
+};
+
 const updateSubscriptionItemsImmediately = async (
-  organizationId: string,
   subscription: NonNullable<Awaited<ReturnType<typeof resolveCurrentSubscription>>>,
   targetPlan: TStandardCloudPlan,
   targetInterval: TCloudBillingInterval
-): Promise<void> => {
+): Promise<TUpgradePaymentConfirmation> => {
   if (!stripeClient) {
-    return;
+    return { clientSecret: null, requiresAction: false };
   }
 
   const targetItems = await getCatalogItemsForPlan(targetPlan, targetInterval);
@@ -661,17 +675,37 @@ const updateSubscriptionItemsImmediately = async (
     deleted: true as const,
   }));
 
-  await stripeClient.subscriptions.update(subscription.id, {
-    cancel_at_period_end: false,
+  // Not a pending-update attribute, so clear it in a separate plain update first.
+  if (subscription.cancel_at_period_end) {
+    await stripeClient.subscriptions.update(subscription.id, {
+      cancel_at_period_end: false,
+    });
+  }
+
+  const updated = await stripeClient.subscriptions.update(subscription.id, {
     items: [...existingDeletions, ...targetItems],
     proration_behavior: "always_invoice",
-    // We don't grant the upgraded plan until Stripe can actually collect the prorated invoice.
-    payment_behavior: "error_if_incomplete",
-    ...(subscription.trial_end ? { trial_end: subscription.trial_end } : {}),
-    metadata: {
-      organizationId,
-    },
+    // Records a pending_update; the plan isn't granted until the invoice is paid (SCA-safe).
+    // Only pending-update-supported attributes are allowed (no metadata/cancel_at_period_end).
+    payment_behavior: "pending_if_incomplete",
   });
+
+  const invoiceId =
+    typeof updated.latest_invoice === "string"
+      ? updated.latest_invoice
+      : (updated.latest_invoice?.id ?? null);
+
+  if (!invoiceId) {
+    return { clientSecret: null, requiresAction: false };
+  }
+
+  // In this API version the PI client secret lives on invoice.confirmation_secret (expand-only).
+  const invoice = await stripeClient.invoices.retrieve(invoiceId, {
+    expand: ["confirmation_secret"],
+  });
+  const clientSecret = invoice.confirmation_secret?.client_secret ?? null;
+
+  return { clientSecret, requiresAction: clientSecret != null };
 };
 
 const getScheduleItemsForPlanChange = async (
@@ -873,12 +907,86 @@ const scheduleSubscriptionPlanChange = async (
   return pendingChange;
 };
 
+/**
+ * Whether a payment method has been collected for the subscription. Checks the subscription
+ * default first, then falls back to the customer-level default so a card saved on the customer
+ * (but not yet attached to the subscription) still counts — this avoids falsely blocking a
+ * legitimately card-backed org on a paid switch.
+ */
+const hasCollectedPaymentMethod = async (
+  subscription: NonNullable<Awaited<ReturnType<typeof resolveCurrentSubscription>>>,
+  customerId: string
+): Promise<boolean> => {
+  if (subscription.default_payment_method != null) {
+    return true;
+  }
+
+  if (!stripeClient) {
+    return false;
+  }
+
+  const customer = await stripeClient.customers.retrieve(customerId);
+  if (customer.deleted) {
+    return false;
+  }
+
+  return customer.invoice_settings?.default_payment_method != null;
+};
+
+/**
+ * Cancels a no-card trial at period end so the org lands on Hobby without ever being converted
+ * into a billable schedule. Releases any stray schedule first (a schedule would otherwise rebuild
+ * the trial into a billable Pro phase), then sets cancel_at_period_end so Stripe cancels the
+ * trialing subscription instead of charging it — no schedule, no card required.
+ */
+const cancelTrialToHobbyAtPeriodEnd = async (
+  organizationId: string,
+  subscription: NonNullable<Awaited<ReturnType<typeof resolveCurrentSubscription>>>
+): Promise<TOrganizationStripePendingChange> => {
+  if (!stripeClient) {
+    throw new Error("Stripe is not configured");
+  }
+
+  if (subscription.schedule) {
+    const scheduleId =
+      typeof subscription.schedule === "string" ? subscription.schedule : subscription.schedule.id;
+    await stripeClient.subscriptionSchedules.release(scheduleId, {
+      preserve_cancel_date: false,
+    });
+  }
+
+  await stripeClient.subscriptions.update(subscription.id, {
+    cancel_at_period_end: true,
+  });
+
+  const effectiveAt =
+    resolvePendingChangeEffectiveAt(subscription) ??
+    (subscription.trial_end ? new Date(subscription.trial_end * 1000).toISOString() : null) ??
+    new Date().toISOString();
+
+  const pendingChange: TOrganizationStripePendingChange = {
+    type: "plan_change",
+    targetPlan: "hobby",
+    targetInterval: "monthly",
+    effectiveAt,
+  };
+
+  await updatePendingPlanChangeSnapshot(organizationId, pendingChange);
+
+  return pendingChange;
+};
+
 export const switchOrganizationToCloudPlan = async (input: {
   organizationId: string;
   customerId: string;
   targetPlan: TStandardCloudPlan;
   targetInterval: TCloudBillingInterval;
-}): Promise<{ mode: "immediate" | "scheduled"; pendingChange: TOrganizationStripePendingChange | null }> => {
+}): Promise<{
+  mode: "immediate" | "scheduled";
+  pendingChange: TOrganizationStripePendingChange | null;
+  clientSecret?: string | null;
+  requiresAction?: boolean;
+}> => {
   const subscription = await getRequiredActiveSubscription(input.organizationId, input.customerId);
   const currentPlan = resolveCloudPlanFromSubscription(subscription);
   const currentInterval = resolveSubscriptionInterval(subscription);
@@ -891,12 +999,28 @@ export const switchOrganizationToCloudPlan = async (input: {
   const isSameSelection = currentPlan === input.targetPlan && currentInterval === input.targetInterval;
 
   if (isSameSelection) {
-    return { mode: "immediate", pendingChange: null };
+    return { mode: "immediate", pendingChange: null, clientSecret: null, requiresAction: false };
+  }
+
+  // A trialing subscription with no payment method must never be converted into a billable
+  // subscription. The scheduled path rebuilds phases without the trial guard, ending the trial and
+  // turning phase 1 into a billable Pro phase; undoing that pending change would then leave the org
+  // on active paid Pro with no card. So special-case it: a downgrade cancels the trial (landing on
+  // Hobby, no card), and any paid switch is rejected and routed through the add-card checkout.
+  if (
+    subscription.status === "trialing" &&
+    !(await hasCollectedPaymentMethod(subscription, input.customerId))
+  ) {
+    if (input.targetPlan === "hobby") {
+      const pendingChange = await cancelTrialToHobbyAtPeriodEnd(input.organizationId, subscription);
+      return { mode: "scheduled", pendingChange, clientSecret: null, requiresAction: false };
+    }
+
+    throw new OperationNotAllowedError("payment_method_required");
   }
 
   if (isImmediateUpgrade) {
-    await updateSubscriptionItemsImmediately(
-      input.organizationId,
+    const confirmation = await updateSubscriptionItemsImmediately(
       subscription,
       input.targetPlan,
       input.targetInterval
@@ -906,7 +1030,12 @@ export const switchOrganizationToCloudPlan = async (input: {
       await clearPendingPlanState(input.organizationId, subscription);
     }
 
-    return { mode: "immediate", pendingChange: null };
+    return {
+      mode: "immediate",
+      pendingChange: null,
+      clientSecret: confirmation.clientSecret,
+      requiresAction: confirmation.requiresAction,
+    };
   }
 
   const pendingChange = await scheduleSubscriptionPlanChange(
@@ -915,7 +1044,37 @@ export const switchOrganizationToCloudPlan = async (input: {
     input.targetPlan,
     input.targetInterval
   );
-  return { mode: "scheduled", pendingChange };
+  return { mode: "scheduled", pendingChange, clientSecret: null, requiresAction: false };
+};
+
+// Previews the invoice an immediate in-place upgrade would generate; mirrors updateSubscriptionItemsImmediately so the amount matches the real charge (estimate — final invoice is authoritative).
+export const previewImmediateUpgradeCharge = async (input: {
+  organizationId: string;
+  customerId: string;
+  targetPlan: Exclude<TStandardCloudPlan, "hobby">;
+  targetInterval: TCloudBillingInterval;
+}): Promise<{ amountDue: number; currency: string } | null> => {
+  if (!stripeClient) {
+    return null;
+  }
+
+  const subscription = await getRequiredActiveSubscription(input.organizationId, input.customerId);
+  const targetItems = await getCatalogItemsForPlan(input.targetPlan, input.targetInterval);
+  const existingDeletions = subscription.items.data.map((item) => ({
+    id: item.id,
+    deleted: true as const,
+  }));
+
+  const preview = await stripeClient.invoices.createPreview({
+    customer: input.customerId,
+    subscription: subscription.id,
+    subscription_details: {
+      items: [...existingDeletions, ...targetItems],
+      proration_behavior: "always_invoice",
+    },
+  });
+
+  return { amountDue: preview.amount_due, currency: preview.currency };
 };
 
 export const undoPendingOrganizationPlanChange = async (
@@ -932,35 +1091,86 @@ const isValidSetupCheckoutUpgradeTarget = (
   return targetPlan === "pro" || targetPlan === "scale";
 };
 
-export const applyPendingUpgradeFromSetupCheckout = async (input: {
+export type TSetupCheckoutUpgradeResult = {
+  mode: "immediate" | "scheduled";
+  clientSecret: string | null;
+  requiresAction: boolean;
+  targetPlan: Exclude<TStandardCloudPlan, "hobby"> | null;
+};
+
+const NO_SETUP_UPGRADE: TSetupCheckoutUpgradeResult = {
+  mode: "immediate",
+  clientSecret: null,
+  requiresAction: false,
+  targetPlan: null,
+};
+
+/**
+ * Client-invoked finalize for a completed setup-mode Checkout upgrade. Attaches the saved
+ * card to the customer + subscription synchronously (no dependency on webhook timing) and
+ * then applies the upgrade, returning any client_secret so the browser can complete 3DS.
+ */
+export const applySetupCheckoutUpgrade = async (input: {
   organizationId: string;
-  customerId: string;
-  targetPlan?: string;
-  targetInterval?: string;
-}): Promise<boolean> => {
-  if (!isValidSetupCheckoutUpgradeTarget(input.targetPlan)) {
-    return false;
+  checkoutSessionId: string;
+}): Promise<TSetupCheckoutUpgradeResult> => {
+  if (!stripeClient) return NO_SETUP_UPGRADE;
+
+  const session = await stripeClient.checkout.sessions.retrieve(input.checkoutSessionId, {
+    expand: ["setup_intent"],
+  });
+
+  if (session.metadata?.organizationId !== input.organizationId) {
+    throw new OperationNotAllowedError("checkout_session_mismatch");
+  }
+  if (session.mode !== "setup" || session.status !== "complete") {
+    return NO_SETUP_UPGRADE;
   }
 
-  const targetInterval: TCloudBillingInterval = input.targetInterval === "yearly" ? "yearly" : "monthly";
-  const subscription = await getRequiredActiveSubscription(input.organizationId, input.customerId);
-  const currentPlan = resolveCloudPlanFromSubscription(subscription);
-  const isNonStandardCurrentPlan = currentPlan === "custom" || currentPlan === "unknown";
-  const isUpgrade =
-    isNonStandardCurrentPlan || CLOUD_PLAN_LEVEL[input.targetPlan] > CLOUD_PLAN_LEVEL[currentPlan];
+  const targetPlan = session.metadata?.targetPlan;
+  if (!isValidSetupCheckoutUpgradeTarget(targetPlan)) {
+    return NO_SETUP_UPGRADE;
+  }
+  const targetInterval: TCloudBillingInterval =
+    session.metadata?.targetInterval === "yearly" ? "yearly" : "monthly";
 
-  if (!isUpgrade) {
-    return false;
+  const customerId = typeof session.customer === "string" ? session.customer : session.customer?.id;
+  if (!customerId) {
+    throw new ResourceNotFoundError("stripeCustomer", input.organizationId);
   }
 
-  await switchOrganizationToCloudPlan({
+  const setupIntent =
+    session.setup_intent && typeof session.setup_intent !== "string" ? session.setup_intent : null;
+  const paymentMethodId =
+    typeof setupIntent?.payment_method === "string"
+      ? setupIntent.payment_method
+      : setupIntent?.payment_method?.id;
+
+  if (paymentMethodId) {
+    await stripeClient.customers.update(customerId, {
+      invoice_settings: { default_payment_method: paymentMethodId },
+    });
+    const subscriptionId = session.metadata?.subscriptionId;
+    if (subscriptionId) {
+      await stripeClient.subscriptions.update(subscriptionId, {
+        default_payment_method: paymentMethodId,
+      });
+    }
+  }
+
+  const result = await switchOrganizationToCloudPlan({
     organizationId: input.organizationId,
-    customerId: input.customerId,
-    targetPlan: input.targetPlan,
+    customerId,
+    targetPlan,
     targetInterval,
   });
 
-  return true;
+  return {
+    mode: result.mode,
+    clientSecret: result.clientSecret ?? null,
+    requiresAction: result.requiresAction ?? false,
+    targetPlan,
+  };
 };
 
 const ensureOrganizationBillingRecord = async (
@@ -1006,13 +1216,13 @@ const ensureOrganizationBillingRecord = async (
  */
 const getOrganizationOwner = async (
   organizationId: string
-): Promise<{ email: string; name: string | null } | null> => {
+): Promise<{ id: string; email: string; name: string | null } | null> => {
   const membership = await prisma.membership.findFirst({
     where: { organizationId, role: "owner" },
-    select: { user: { select: { email: true, name: true } } },
+    select: { user: { select: { id: true, email: true, name: true } } },
   });
   if (!membership) return null;
-  return { email: membership.user.email, name: membership.user.name };
+  return { id: membership.user.id, email: membership.user.email, name: membership.user.name };
 };
 
 export const ensureStripeCustomerForOrganization = async (
@@ -1150,6 +1360,94 @@ const resolvePendingPlanChange = async (subscription: Stripe.Subscription | null
   return null;
 };
 
+type TSubscriptionLifecycleTransition = {
+  startedPaidSubscription: boolean;
+  canceledPaidSubscription: boolean;
+  switchedPaidPlan: boolean;
+};
+
+const resolveSubscriptionLifecycleTransition = (
+  existingStripeSnapshot: TOrganizationBilling["stripe"],
+  subscription: Stripe.Subscription | null,
+  subscriptionStatus: TOrganizationStripeSubscriptionStatus | null,
+  cloudPlan: TCloudStripePlan
+): TSubscriptionLifecycleTransition => {
+  const wasPaidActive =
+    existingStripeSnapshot?.subscriptionStatus === "active" && isPaidCloudPlan(existingStripeSnapshot?.plan);
+  const isPaidActive = subscriptionStatus === "active" && isPaidCloudPlan(cloudPlan);
+  const recoveredFromDunning =
+    existingStripeSnapshot?.subscriptionStatus === "past_due" ||
+    existingStripeSnapshot?.subscriptionStatus === "unpaid" ||
+    existingStripeSnapshot?.subscriptionStatus === "paused";
+  const wasPaidRecoverable =
+    isPaidCloudPlan(existingStripeSnapshot?.plan) &&
+    (existingStripeSnapshot?.subscriptionStatus === "active" || recoveredFromDunning);
+  const subscriptionEnded = !subscription || subscriptionStatus === "canceled" || cloudPlan === "hobby";
+
+  return {
+    startedPaidSubscription: isPaidActive && !wasPaidActive && !recoveredFromDunning,
+    canceledPaidSubscription: wasPaidRecoverable && subscriptionEnded,
+    // Plan switch within an active paid subscription (Pro <-> Scale, either direction).
+    switchedPaidPlan: wasPaidActive && isPaidActive && existingStripeSnapshot?.plan !== cloudPlan,
+  };
+};
+
+// Emit the paid-subscription lifecycle signal, keyed off the org owner so it ties to a person in
+// PostHog (with the organization group for company attribution).
+const emitSubscriptionLifecycleEvent = async (input: {
+  organizationId: string;
+  existingStripeSnapshot: TOrganizationBilling["stripe"];
+  cloudPlan: TCloudStripePlan;
+  billingInterval: TCloudBillingInterval | null;
+  transition: TSubscriptionLifecycleTransition;
+}): Promise<void> => {
+  const { organizationId, existingStripeSnapshot, cloudPlan, billingInterval, transition } = input;
+  const { startedPaidSubscription, canceledPaidSubscription, switchedPaidPlan } = transition;
+
+  if (!startedPaidSubscription && !canceledPaidSubscription && !switchedPaidPlan) {
+    return;
+  }
+
+  // Best-effort: the billing snapshot is already persisted, so a failure here (owner lookup DB blip,
+  // etc.) must not reject the sync — a retried sync would see the new state and detect no transition,
+  // permanently dropping the event. Swallow and log instead.
+  try {
+    const owner = await getOrganizationOwner(organizationId);
+    if (!owner) {
+      return;
+    }
+
+    if (switchedPaidPlan) {
+      capturePostHogEvent(
+        owner.id,
+        "subscription_updated",
+        {
+          previous_plan: existingStripeSnapshot?.plan ?? null,
+          plan: cloudPlan,
+          interval: billingInterval,
+          organization_id: organizationId,
+        },
+        { organizationId }
+      );
+      return;
+    }
+
+    capturePostHogEvent(
+      owner.id,
+      startedPaidSubscription ? "subscription_started" : "subscription_canceled",
+      {
+        // On cancel the new snapshot has already dropped to hobby/none, so report the prior plan.
+        plan: startedPaidSubscription ? cloudPlan : (existingStripeSnapshot?.plan ?? null),
+        interval: startedPaidSubscription ? billingInterval : (existingStripeSnapshot?.interval ?? null),
+        organization_id: organizationId,
+      },
+      { organizationId }
+    );
+  } catch (error) {
+    logger.error({ error, organizationId }, "Failed to emit subscription lifecycle event to PostHog");
+  }
+};
+
 export const syncOrganizationBillingFromStripe = async (
   organizationId: string,
   event?: { id: string; created: number }
@@ -1185,6 +1483,18 @@ export const syncOrganizationBillingFromStripe = async (
   const subscriptionStatus = resolveSubscriptionStatus(subscription);
   const usageCycleAnchor = resolveUsageCycleAnchor(subscription);
   const pendingChange = await resolvePendingPlanChange(subscription);
+  // Match the guard in switchOrganizationToCloudPlan / changeBillingPlanAction: a card saved on the
+  // customer (but not yet attached to the subscription) still counts, so the cached flag must not
+  // falsely block a legitimately card-backed org on a paid switch.
+  const hasPaymentMethod = subscription ? await hasCollectedPaymentMethod(subscription, customerId) : false;
+
+  const transition = resolveSubscriptionLifecycleTransition(
+    existingStripeSnapshot,
+    subscription,
+    subscriptionStatus,
+    cloudPlan
+  );
+
   const limits = resolveEntitlementDrivenLimits(
     organizationId,
     customerId,
@@ -1203,9 +1513,16 @@ export const syncOrganizationBillingFromStripe = async (
       interval: billingInterval,
       subscriptionStatus,
       subscriptionId: subscription?.id ?? null,
-      hasPaymentMethod: subscription?.default_payment_method != null,
+      hasPaymentMethod,
       features: featureLookupKeys,
       pendingChange,
+      // Clear the payment-failure banner only when this sync reflects a real settlement:
+      // an authoritative webhook event or an observed plan change. A read-through sync
+      // triggered by snapshot staleness must not silently dismiss an unresolved failure.
+      paymentAttemptError:
+        event || cloudPlan !== existingStripeSnapshot?.plan
+          ? null
+          : (existingStripeSnapshot?.paymentAttemptError ?? null),
       lastStripeEventCreatedAt: toIsoStringOrNull(incomingEventDate ?? previousEventDate),
       lastSyncedAt: new Date().toISOString(),
       lastSyncedEventId: event?.id ?? existingStripeSnapshot?.lastSyncedEventId ?? null,
@@ -1226,6 +1543,15 @@ export const syncOrganizationBillingFromStripe = async (
   });
 
   await invalidateOrganizationBillingCache(organizationId);
+
+  await emitSubscriptionLifecycleEvent({
+    organizationId,
+    existingStripeSnapshot,
+    cloudPlan,
+    billingInterval,
+    transition,
+  });
+
   return updatedBilling;
 };
 
@@ -1257,6 +1583,43 @@ export const addOptimisticBillingFeature = async (organizationId: string, featur
   await prisma.organizationBilling.update({
     where: { organizationId },
     data: { stripe: updatedStripe },
+  });
+
+  await invalidateOrganizationBillingCache(organizationId);
+};
+
+/**
+ * Set (or clear, via `null`) the payment-failure banner on the billing page.
+ * Preserves the rest of the stripe snapshot and invalidates the billing cache.
+ */
+export const setOrganizationPaymentAttemptError = async (
+  organizationId: string,
+  paymentAttemptError: TOrganizationStripeBilling["paymentAttemptError"],
+  event?: { id: string; created: number }
+): Promise<void> => {
+  const billing = await ensureOrganizationBillingRecord(organizationId);
+  if (!billing) return;
+
+  // Idempotency: ignore a replayed/out-of-order event older than the last processed one, so
+  // a stale payment_intent webhook can't resurrect a banner a newer sync already resolved.
+  if (event) {
+    const lastEventDate = getDateFromBilling(billing.stripe?.lastStripeEventCreatedAt ?? null);
+    if (lastEventDate && new Date(event.created * 1000) < lastEventDate) {
+      return;
+    }
+  }
+
+  const nextStripeSnapshot = billing.stripe ? { ...billing.stripe } : {};
+
+  await prisma.organizationBilling.update({
+    where: { organizationId },
+    data: {
+      stripe: {
+        ...nextStripeSnapshot,
+        paymentAttemptError,
+        lastSyncedAt: new Date().toISOString(),
+      },
+    },
   });
 
   await invalidateOrganizationBillingCache(organizationId);

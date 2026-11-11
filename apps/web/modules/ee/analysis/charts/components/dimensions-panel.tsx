@@ -22,7 +22,8 @@ export function DimensionsPanel({
 
   const dimensionOptions = FEEDBACK_FIELDS.dimensions.map((d) => ({
     value: d.id,
-    label: [getTranslatedFieldLabel(d.id, t), d.description].filter(Boolean).join(" - "),
+    label: getTranslatedFieldLabel(d.id, t),
+    description: d.description,
     icon: d.isGenerated ? <SparklesIcon className="size-4 text-slate-500" aria-hidden="true" /> : undefined,
   }));
 
@@ -31,7 +32,7 @@ export function DimensionsPanel({
       {!hideTitle && (
         <h3 className="text-md font-semibold text-gray-900">{t("workspace.analysis.charts.dimensions")}</h3>
       )}
-      <div className="space-y-2">
+      <div className="space-y-3">
         <Label className="text-sm">{t("workspace.analysis.charts.group_by")}</Label>
         <MultiSelect
           options={dimensionOptions}

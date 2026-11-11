@@ -329,22 +329,10 @@ export const login = async (page: Page, email: string, password: string): Promis
 };
 
 export const apiLogin = async (page: Page, email: string, password: string) => {
-  const csrfToken = await page
-    .context()
-    .request.get("/api/auth/csrf")
-    .then((response) => response.json())
-    .then((json) => json.csrfToken);
-  const data = {
-    email,
-    password,
-    callbackURL: "/",
-    redirect: "true",
-    json: "true",
-    csrfToken,
-  };
-
-  return page.context().request.post("/api/auth/callback/credentials", {
-    data,
+  // Better Auth sign-in (replaces the NextAuth csrf + credentials-callback flow). The signed session
+  // cookie set on the response is shared with the browser through Playwright's request/context jar.
+  return page.context().request.post("/api/auth/sign-in/email", {
+    data: { email, password },
   });
 };
 
@@ -527,7 +515,7 @@ export const createSurvey = async (page: Page, params: CreateSurveyParams) => {
     .filter({ hasText: new RegExp(`^${addBlock}$`) })
     .nth(1)
     .click();
-  await page.getByRole("button", { name: "Multi-Select Ask respondents" }).click();
+  await page.getByRole("button", { name: "Multi-Select", exact: true }).click();
   await fillRichTextEditor(page, "Question*", params.multiSelectQuestion.question);
   await page.getByRole("button", { name: "Add description", exact: true }).click();
   await fillRichTextEditor(page, "Description", params.multiSelectQuestion.description);
@@ -743,7 +731,7 @@ export const createSurveyWithLogic = async (page: Page, params: CreateSurveyWith
     .filter({ hasText: new RegExp(`^${addBlock}$`) })
     .nth(1)
     .click();
-  await page.getByRole("button", { name: "Multi-Select Ask respondents" }).click();
+  await page.getByRole("button", { name: "Multi-Select", exact: true }).click();
   await fillRichTextEditor(page, "Question*", params.multiSelectQuestion.question);
   await page.getByRole("button", { name: "Add description" }).click();
   await fillRichTextEditor(page, "Description", params.multiSelectQuestion.description);

@@ -4,9 +4,9 @@ import { TResponse } from "@formbricks/types/responses";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { transformResponseToFeedbackRecords } from "./transform";
 
-vi.mock("@/lib/i18n/utils", () => ({
-  getLocalizedValue: (_val: Record<string, string>, _lang: string) => _val?.default ?? "",
-}));
+// Deliberately unmocked: @/lib/i18n/utils — the real getLocalizedValue has NO default-language
+// fallback, and an earlier mock that added one hid a bug where default-language responses
+// carrying a concrete code (e.g. "en-US") never matched choice labels keyed "default".
 
 vi.mock("@formbricks/types/surveys/validation", () => ({
   getTextContent: (str: string) => str,
@@ -18,6 +18,12 @@ vi.mock("@/lib/survey/utils", () => ({
 }));
 
 const NOW = new Date("2026-02-24T10:00:00.000Z");
+
+// Minimal TSurveyLanguage[] for a survey whose default language is en-US with Arabic enabled.
+const bilingualLanguages = [
+  { language: { code: "en-US" }, default: true, enabled: true },
+  { language: { code: "ar" }, default: false, enabled: true },
+];
 
 const mockSurvey = {
   id: "survey-1",
@@ -171,11 +177,17 @@ describe("transformResponseToFeedbackRecords", () => {
     expect(result[0].value_boolean).toBe(true);
   });
 
-  test("transforms categorical (multi-select) field to comma-separated text", () => {
+  test("splits a multi-select answer into one record per selected option", () => {
     const mappings = [createMapping({ elementId: "el-multi", hubFieldType: "categorical" })];
     const result = transformResponseToFeedbackRecords(mockResponse, mockSurvey, mappings, mockTenantId);
-    expect(result).toHaveLength(1);
-    expect(result[0].value_text).toBe("feat-a, feat-b");
+    expect(result).toHaveLength(2);
+    // el-multi has no choices in this fixture, so entries stay unmatched (no value_id) but still
+    // split, each tied back to the question via field_group_id and to the respondent via submission_id.
+    expect(result.map((r) => r.field_id)).toEqual(["el-multi__feat-a", "el-multi__feat-b"]);
+    expect(result.map((r) => r.value_text)).toEqual(["feat-a", "feat-b"]);
+    expect(result.every((r) => r.field_group_id === "el-multi")).toBe(true);
+    expect(result.every((r) => r.submission_id === "resp-1")).toBe(true);
+    expect(result.every((r) => r.value_id === undefined)).toBe(true);
   });
 
   test("uses customFieldLabel when provided", () => {
@@ -232,9 +244,18 @@ describe("transformResponseToFeedbackRecords", () => {
 
   test("transforms all mappings in a single call", () => {
     const result = transformResponseToFeedbackRecords(mockResponse, mockSurvey, allMappings, mockTenantId);
-    expect(result).toHaveLength(6);
+    // el-multi splits into one record per selected option, so it contributes two rows.
+    expect(result).toHaveLength(7);
     const fieldIds = result.map((r) => r.field_id);
-    expect(fieldIds).toEqual(["el-text", "el-nps", "el-rating", "el-date", "el-bool", "el-multi"]);
+    expect(fieldIds).toEqual([
+      "el-text",
+      "el-nps",
+      "el-rating",
+      "el-date",
+      "el-bool",
+      "el-multi__feat-a",
+      "el-multi__feat-b",
+    ]);
   });
 
   test("falls back to 'Untitled' for element with no headline", () => {
@@ -323,12 +344,29 @@ describe("transformResponseToFeedbackRecords", () => {
     });
 
     test("handles single string value for categorical field", () => {
+      // Provide an element with a choices array so the choice-lookup path does not crash.
+      // The submitted value does not match any choice, so it passes through unchanged.
+      const surveyWithChoices = {
+        ...mockSurvey,
+        blocks: [
+          {
+            elements: [
+              {
+                id: "el-multi",
+                type: "multipleChoiceMulti",
+                headline: { default: "Select features" },
+                choices: [{ id: "ch-a", label: { default: "Option A" } }],
+              },
+            ],
+          },
+        ],
+      } as unknown as TSurvey;
       const response = {
         ...mockResponse,
         data: { "el-multi": "single-choice" },
       } as unknown as TResponse;
       const mappings = [createMapping({ elementId: "el-multi", hubFieldType: "categorical" })];
-      const result = transformResponseToFeedbackRecords(response, mockSurvey, mappings, mockTenantId);
+      const result = transformResponseToFeedbackRecords(response, surveyWithChoices, mappings, mockTenantId);
       expect(result[0].value_text).toBe("single-choice");
     });
 
@@ -343,24 +381,26 @@ describe("transformResponseToFeedbackRecords", () => {
       expect(result[0].value_text).not.toBe("[object Object]");
     });
 
-    test("creates a record for a ranking response (string array)", () => {
+    test("joins array values to comma-separated text for non-choice elements", () => {
+      // An element absent from the survey definition has no type, so the generic path stores the
+      // raw array joined. The per-option split only applies to multipleChoiceMulti elements.
       const response = {
         ...mockResponse,
-        data: { "el-multi": ["LabelA", "LabelB", "LabelC"] },
+        data: { "el-array": ["LabelA", "LabelB", "LabelC"] },
       } as unknown as TResponse;
-      const mappings = [createMapping({ elementId: "el-multi", hubFieldType: "categorical" })];
+      const mappings = [createMapping({ elementId: "el-array", hubFieldType: "categorical" })];
       const result = transformResponseToFeedbackRecords(response, mockSurvey, mappings, mockTenantId);
       expect(result).toHaveLength(1);
-      expect(result[0].field_id).toBe("el-multi");
+      expect(result[0].field_id).toBe("el-array");
       expect(result[0].value_text).toBe("LabelA, LabelB, LabelC");
     });
 
-    test("creates a record for an empty ranking response (empty array)", () => {
+    test("joins an empty array to an empty string for non-choice elements", () => {
       const response = {
         ...mockResponse,
-        data: { "el-multi": [] },
+        data: { "el-array": [] },
       } as unknown as TResponse;
-      const mappings = [createMapping({ elementId: "el-multi", hubFieldType: "categorical" })];
+      const mappings = [createMapping({ elementId: "el-array", hubFieldType: "categorical" })];
       const result = transformResponseToFeedbackRecords(response, mockSurvey, mappings, mockTenantId);
       expect(result).toHaveLength(1);
       expect(result[0].value_text).toBe("");
@@ -430,6 +470,7 @@ describe("transformResponseToFeedbackRecords", () => {
         field_id: "el-matrix__row-1",
         field_label: "Speed",
         field_type: "categorical",
+        // value_text = default-language label (canonical) — for default-language responses this equals the submitted label.
         value_text: "Good",
       });
       expect(result[1]).toMatchObject({
@@ -588,6 +629,296 @@ describe("transformResponseToFeedbackRecords", () => {
       expect(result).toHaveLength(1);
       expect(result[0].field_id).toBe("el-ranking__ch-1");
       expect(result[0].value_number).toBe(1);
+    });
+  });
+
+  describe("choice values across languages (value_text = default-language label (canonical), value_id = stable choice id)", () => {
+    const bilingualSurvey = {
+      id: "survey-1",
+      name: "Bilingual Survey",
+      languages: bilingualLanguages,
+      blocks: [
+        {
+          elements: [
+            {
+              id: "el-gender",
+              type: "multipleChoiceSingle",
+              headline: { default: "Gender", ar: "الجنس" },
+              choices: [
+                { id: "c-male", label: { default: "Male", ar: "ذكر" } },
+                { id: "c-female", label: { default: "Female", ar: "أنثى" } },
+              ],
+            },
+            {
+              id: "el-feats",
+              type: "multipleChoiceMulti",
+              headline: { default: "Select features" },
+              choices: [
+                { id: "c-speed", label: { default: "Speed", ar: "سرعة" } },
+                { id: "c-quality", label: { default: "Quality", ar: "جودة" } },
+              ],
+            },
+          ],
+        },
+      ],
+    } as unknown as TSurvey;
+
+    const buildResponse = (data: Record<string, unknown>, language: string): TResponse =>
+      ({
+        id: "resp-i18n",
+        createdAt: NOW,
+        data,
+        language,
+      }) as unknown as TResponse;
+
+    test("stores the default-language label for a single select answered in another language, with the choice id as identity", () => {
+      const response = buildResponse({ "el-gender": "ذكر" }, "ar");
+      const mappings = [createMapping({ elementId: "el-gender", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, bilingualSurvey, mappings, mockTenantId);
+
+      expect(result).toHaveLength(1);
+      // value_text = default-language label (canonical); value_id is the stable grouping key.
+      expect(result[0].value_text).toBe("Male");
+      expect(result[0].value_id).toBe("c-male");
+      expect(result[0].language).toBe("ar");
+    });
+
+    test("splits a multi select answered in another language into per-option records with default-language labels", () => {
+      const response = buildResponse({ "el-feats": ["سرعة", "جودة"] }, "ar");
+      const mappings = [createMapping({ elementId: "el-feats", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, bilingualSurvey, mappings, mockTenantId);
+
+      // One record per selection; each value_text is the canonical default-language label and each
+      // carries its stable choice id, regardless of the response language.
+      expect(result).toHaveLength(2);
+      expect(result.map((r) => r.value_text)).toEqual(["Speed", "Quality"]);
+      expect(result.map((r) => r.value_id)).toEqual(["c-speed", "c-quality"]);
+      expect(result.map((r) => r.field_id)).toEqual(["el-feats__c-speed", "el-feats__c-quality"]);
+      expect(result.every((r) => r.field_group_id === "el-feats")).toBe(true);
+    });
+
+    test("splits a multi select and passes unmatched free text through per option", () => {
+      const response = buildResponse({ "el-feats": ["سرعة", "something else"] }, "ar");
+      const mappings = [createMapping({ elementId: "el-feats", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, bilingualSurvey, mappings, mockTenantId);
+
+      // Matched entry canonicalizes to its default-language label with its choice id; the unmatched
+      // free text passes through and carries no value_id (el-feats offers no "other" option).
+      expect(result).toHaveLength(2);
+      expect(result[0]).toMatchObject({ value_text: "Speed", value_id: "c-speed" });
+      expect(result[1]).toMatchObject({ value_text: "something else" });
+      expect(result[1].value_id).toBeUndefined();
+    });
+
+    test("stores the original label for default-language answers (unchanged since submitted=default)", () => {
+      const response = buildResponse({ "el-gender": "Female" }, "default");
+      const mappings = [createMapping({ elementId: "el-gender", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, bilingualSurvey, mappings, mockTenantId);
+
+      // value_text = default-language label (canonical); for default-language answers this equals the submitted label.
+      expect(result[0].value_text).toBe("Female");
+    });
+
+    test("matches choices when the response carries the default language's concrete code", () => {
+      // Labels for the default language live under the "default" key, but responses may
+      // record the concrete code (e.g. "en-US") — the lookup must map it back to "default".
+      const response = buildResponse({ "el-gender": "Female" }, "en-US");
+      const mappings = [createMapping({ elementId: "el-gender", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, bilingualSurvey, mappings, mockTenantId);
+
+      // value_text = default-language label (canonical); value_id = stable choice id.
+      expect(result[0].value_text).toBe("Female");
+      expect(result[0].value_id).toBe("c-female");
+      expect(result[0].language).toBe("en-US");
+    });
+
+    test("stores the default-language label for a matrix column answered in another language", () => {
+      const matrixSurvey = {
+        id: "survey-1",
+        name: "Matrix Survey",
+        languages: bilingualLanguages,
+        blocks: [
+          {
+            elements: [
+              {
+                id: "el-matrix",
+                type: "matrix",
+                headline: { default: "Rate each feature" },
+                rows: [{ id: "row-1", label: { default: "Speed", ar: "سرعة" } }],
+                columns: [
+                  { id: "col-1", label: { default: "Good", ar: "جيد" } },
+                  { id: "col-2", label: { default: "Bad", ar: "سيئ" } },
+                ],
+              },
+            ],
+          },
+        ],
+      } as unknown as TSurvey;
+      const response = buildResponse({ "el-matrix": { سرعة: "جيد" } }, "ar");
+      const mappings = [createMapping({ elementId: "el-matrix", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, matrixSurvey, mappings, mockTenantId);
+
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        field_id: "el-matrix__row-1",
+        field_label: "Speed",
+        // value_text = default-language label (canonical); value_id = stable column id.
+        value_text: "Good",
+        value_id: "col-1",
+      });
+    });
+  });
+
+  describe("stable option identity via value_id (ENG-1673)", () => {
+    const survey = {
+      id: "survey-1",
+      name: "Identity Survey",
+      languages: bilingualLanguages,
+      blocks: [
+        {
+          elements: [
+            {
+              id: "el-gender",
+              type: "multipleChoiceSingle",
+              headline: { default: "Gender", ar: "الجنس" },
+              choices: [
+                { id: "c-male", label: { default: "Male", ar: "ذكر" } },
+                { id: "c-female", label: { default: "Female", ar: "أنثى" } },
+              ],
+            },
+            {
+              id: "el-feats",
+              type: "multipleChoiceMulti",
+              headline: { default: "Select features" },
+              choices: [
+                { id: "c-speed", label: { default: "Speed" } },
+                { id: "c-quality", label: { default: "Quality" } },
+              ],
+            },
+            {
+              id: "el-text",
+              type: "openText",
+              headline: { default: "Anything else?" },
+            },
+          ],
+        },
+      ],
+    } as unknown as TSurvey;
+
+    const buildResponse = (data: Record<string, unknown>, language = "default"): TResponse =>
+      ({
+        id: "resp-value-id",
+        createdAt: NOW,
+        data,
+        language,
+      }) as unknown as TResponse;
+
+    test("sets value_id to the matched choice id for a single select; value_text stores the default-language label (canonical)", () => {
+      const response = buildResponse({ "el-gender": "ذكر" }, "ar");
+      const mappings = [createMapping({ elementId: "el-gender", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, survey, mappings, mockTenantId);
+
+      expect(result[0].value_id).toBe("c-male");
+      // value_text = default-language label (canonical), regardless of the response language.
+      expect(result[0].value_text).toBe("Male");
+    });
+
+    test("sets value_id for default-language single select answers too", () => {
+      const response = buildResponse({ "el-gender": "Female" });
+      const mappings = [createMapping({ elementId: "el-gender", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, survey, mappings, mockTenantId);
+
+      expect(result[0].value_id).toBe("c-female");
+      // value_text = default-language label (canonical); for default-language answers this equals the submitted label.
+      expect(result[0].value_text).toBe("Female");
+    });
+
+    test("sets value_id when the response carries the default language's concrete code (ENG-1673 regression)", () => {
+      const response = buildResponse({ "el-gender": "Female" }, "en-US");
+      const mappings = [createMapping({ elementId: "el-gender", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, survey, mappings, mockTenantId);
+
+      expect(result[0].value_id).toBe("c-female");
+      // value_text = default-language label (canonical); same as submitted since answered in default language.
+      expect(result[0].value_text).toBe("Female");
+    });
+
+    test("omits value_id when the value matches no choice (other / free text)", () => {
+      const response = buildResponse({ "el-gender": "self-described" });
+      const mappings = [createMapping({ elementId: "el-gender", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, survey, mappings, mockTenantId);
+
+      expect(result[0].value_id).toBeUndefined();
+      expect(result[0].value_text).toBe("self-described");
+    });
+
+    // Multi-select splits into one record per selected option (ENG-1702), so each option keeps
+    // its own stable value_id instead of collapsing into a single joined record.
+    test("sets a value_id per selected option for multi select", () => {
+      const response = buildResponse({ "el-feats": ["Speed", "Quality"] });
+      const mappings = [createMapping({ elementId: "el-feats", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, survey, mappings, mockTenantId);
+
+      expect(result).toHaveLength(2);
+      expect(result.map((r) => r.value_id)).toEqual(["c-speed", "c-quality"]);
+      expect(result.map((r) => r.value_text)).toEqual(["Speed", "Quality"]);
+      expect(result.map((r) => r.field_id)).toEqual(["el-feats__c-speed", "el-feats__c-quality"]);
+      expect(result.every((r) => r.field_group_id === "el-feats")).toBe(true);
+    });
+
+    test("omits value_id for non-choice elements", () => {
+      const response = buildResponse({ "el-text": "free text" });
+      const mappings = [createMapping({ elementId: "el-text", hubFieldType: "text" })];
+
+      const result = transformResponseToFeedbackRecords(response, survey, mappings, mockTenantId);
+
+      expect(result[0].value_id).toBeUndefined();
+    });
+
+    test("sets value_id to the matched column id for matrix answers; value_text is the default-language label (canonical)", () => {
+      const matrixSurvey = {
+        id: "survey-1",
+        name: "Matrix Survey",
+        languages: bilingualLanguages,
+        blocks: [
+          {
+            elements: [
+              {
+                id: "el-matrix",
+                type: "matrix",
+                headline: { default: "Rate each feature" },
+                rows: [{ id: "row-1", label: { default: "Speed", ar: "سرعة" } }],
+                columns: [
+                  { id: "col-1", label: { default: "Good", ar: "جيد" } },
+                  { id: "col-2", label: { default: "Bad", ar: "سيئ" } },
+                ],
+              },
+            ],
+          },
+        ],
+      } as unknown as TSurvey;
+      const response = buildResponse({ "el-matrix": { سرعة: "جيد" } }, "ar");
+      const mappings = [createMapping({ elementId: "el-matrix", hubFieldType: "categorical" })];
+
+      const result = transformResponseToFeedbackRecords(response, matrixSurvey, mappings, mockTenantId);
+
+      expect(result[0]).toMatchObject({
+        field_id: "el-matrix__row-1",
+        // value_text = default-language label (canonical); value_id = stable column id.
+        value_text: "Good",
+        value_id: "col-1",
+      });
     });
   });
 });

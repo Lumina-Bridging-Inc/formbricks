@@ -34,7 +34,9 @@ vi.mock("@/lib/utils/helper", () => ({
   getOrganizationIdFromWorkspaceId: vi.fn(),
 }));
 
-vi.mock("@/lib/response/utils", () => ({
+vi.mock("@/lib/response/utils", async (importOriginal) => ({
+  // keep the real normalizeResponseLanguage; calculateTtcTotal stays mockable (tests configure it)
+  ...(await importOriginal<typeof import("@/lib/response/utils")>()),
   calculateTtcTotal: vi.fn((ttc) => ttc),
 }));
 
@@ -136,6 +138,24 @@ describe("createResponse", () => {
     );
   });
 
+  test("should persist endingId when provided", async () => {
+    await createResponse({ ...mockResponseInput, finished: true, endingId: "ending-card-id" }, prisma);
+    expect(prisma.response.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ finished: true, endingId: "ending-card-id" }),
+      })
+    );
+  });
+
+  test("should default endingId to null when not provided", async () => {
+    await createResponse(mockResponseInput, prisma);
+    expect(prisma.response.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ endingId: null }),
+      })
+    );
+  });
+
   test("should throw ResourceNotFoundError if organization not found", async () => {
     vi.mocked(getOrganization).mockResolvedValue(null);
     await expect(createResponse(mockResponseInput, prisma)).rejects.toThrow(ResourceNotFoundError);
@@ -154,7 +174,7 @@ describe("createResponse", () => {
     const prismaError = new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
       code: "P2002",
       clientVersion: "test",
-      meta: { target: ["surveyId", "singleUseId"] },
+      meta: { driverAdapterError: { cause: { constraint: { fields: ["surveyId", "singleUseId"] } } } },
     });
     vi.mocked(prisma.response.create).mockRejectedValue(prismaError);
     await expect(createResponse(mockResponseInput, prisma)).rejects.toThrow(UniqueConstraintError);
@@ -164,7 +184,7 @@ describe("createResponse", () => {
     const prismaError = new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
       code: "P2002",
       clientVersion: "test",
-      meta: { target: ["displayId"] },
+      meta: { driverAdapterError: { cause: { constraint: { fields: ["displayId"] } } } },
     });
     vi.mocked(prisma.response.create).mockRejectedValue(prismaError);
     await expect(createResponse(mockResponseInput, prisma)).rejects.toThrow(InvalidInputError);
@@ -210,7 +230,7 @@ describe("createResponseWithQuotaEvaluation", () => {
       responseId: responseId,
       data: mockResponseInput.data,
       variables: mockResponseInput.variables,
-      language: mockResponseInput.language,
+      language: undefined, // null language is normalized to undefined for quota evaluation
       responseFinished: mockResponseInput.finished,
       tx: mockTx,
     });
@@ -264,7 +284,7 @@ describe("createResponseWithQuotaEvaluation", () => {
       responseId: responseId,
       data: mockResponseInput.data,
       variables: mockResponseInput.variables,
-      language: mockResponseInput.language,
+      language: undefined, // null language is normalized to undefined for quota evaluation
       responseFinished: mockResponseInput.finished,
       tx: mockTx,
     });
