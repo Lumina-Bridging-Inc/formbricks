@@ -322,7 +322,8 @@ USER nextjs
 RUN mkdir -p /home/nextjs/apps/web/uploads/ && \
     mkdir -p /home/nextjs/apps/web/saml-connection
 
-VOLUME /home/nextjs/apps/web/uploads/
-VOLUME /home/nextjs/apps/web/saml-connection
+# No VOLUME instructions: Railway rejects Dockerfiles that declare them ("Dockerfile failed
+# validation") and requires Railway Volumes instead. Mount these directories explicitly where
+# persistence is needed (docker/docker-compose.yml mounts saml-connection).
 
 CMD ["/home/nextjs/start.sh"]
